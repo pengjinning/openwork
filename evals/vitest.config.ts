@@ -8,12 +8,14 @@ const common = {
 export default defineConfig({
   test: {
     ...common,
+    fileParallelism: false,
     projects: [
       {
         test: {
           ...common,
           name: "pr",
-          include: ["evals/specs/**/*.test.ts"],
+          // Naming convention: *.slow.test.ts drives Electron/Den and is nightly-only; every other spec must be app-less.
+          include: ["specs/**/*.test.ts"],
           exclude: ["**/*.slow.test.ts"],
         },
       },
@@ -21,7 +23,9 @@ export default defineConfig({
         test: {
           ...common,
           name: "nightly",
-          include: ["evals/specs/**/*.test.ts"],
+          testTimeout: 600_000,
+          hookTimeout: 600_000,
+          include: ["specs/**/*.test.ts"],
         },
       },
     ],
