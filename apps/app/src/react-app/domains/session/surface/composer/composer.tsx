@@ -12,7 +12,7 @@ import {
   type McpDirectoryInfo,
 } from "@/app/constants";
 import type { CloudImportedPlugin, CloudImportedPluginFile } from "@/app/cloud/import-state";
-import type { ComposerAttachment, McpServerEntry, McpStatusMap, ModelRef, SkillCard, SlashCommandOption } from "@/app/types";
+import type { ComposerAttachment, McpServerEntry, McpStatusMap, ModelOption, ModelRef, SkillCard, SlashCommandOption } from "@/app/types";
 import { isMacPlatform } from "@/app/utils";
 import { t } from "@/i18n";
 import { isOpenWorkExtensionEnabled, isOpenWorkExtensionHidden, OPENWORK_EXTENSION_STATE_CHANGED } from "@/react-app/domains/settings/extension-state";
@@ -21,7 +21,7 @@ import { usePlatform } from "@/react-app/kernel/platform";
 import { resolveExtensionIconUrl } from "@/react-app/design-system/extension-icon-src";
 import { ModelBehaviorSelect } from "@/components/model-behavior-select";
 import { ModelSelect } from "@/components/model-select";
-import { LexicalPromptEditor, type LexicalPromptEditorHandle } from "./editor";
+import { LexicalPromptEditor, syncAttachmentChipStatus, type LexicalPromptEditorHandle } from "./editor";
 import { listRunningAppsForMention } from "./app-mentions";
 import type { ComposerMentionKind } from "./mention-encoding";
 import {
@@ -63,8 +63,6 @@ type ComposerProps = {
   busy: boolean;
   steering: boolean;
   submissionPreparing: boolean;
-  submissionBlocked: boolean;
-  submissionInputStatusLabel?: string;
   queuedCount: number;
   disabled: boolean;
   modelUnavailable?: boolean;
@@ -73,9 +71,11 @@ type ComposerProps = {
   statusLabel: string;
   modelPickerOpen: boolean;
   selectedModel: ModelRef;
+  modelOptions?: readonly ModelOption[];
   /** When set, the full model picker opened from here targets this session. */
   sessionId?: string;
   openWorkModelsEntitled?: boolean;
+  openWorkModelsSyncing?: boolean;
   onRefreshOrganizationModels?: () => void | Promise<void>;
   onModelPickerOpenChange: (open: boolean) => void;
   onModelChange: (model: ModelRef) => void;
@@ -83,6 +83,8 @@ type ComposerProps = {
   onAttachFiles: (files: File[]) => void;
   onRemoveAttachment: (id: string) => void;
   attachmentsEnabled: boolean;
+  /** True while the draft's attachments are being compressed/uploaded during a send; chips show a spinner overlay. */
+  attachmentsUploading?: boolean;
   attachmentsDisabledReason: string | null;
   modelVariantLabel: string;
   modelVariant: string | null;
@@ -124,9 +126,6 @@ type ComposerProps = {
 
 const FLUSH_PROMPT_EVENT = "openwork:flushPromptDraft";
 const FOCUS_PROMPT_EVENT = "openwork:focusPrompt";
-const IMAGE_COMPRESS_MAX_PX = 2048;
-const IMAGE_COMPRESS_QUALITY = 0.82;
-const IMAGE_COMPRESS_TARGET_BYTES = 1_500_000;
 const DEFAULT_AGENT_NAME = "openwork";
 
 function isNonDefaultAgent(agent: Agent) {
@@ -160,55 +159,6 @@ function parseClipboardUriList(clipboard: DataTransfer) {
 
 function isImageAttachment(attachment: ComposerAttachment) {
   return attachment.kind === "image" || attachment.mimeType.startsWith("image/");
-}
-
-async function compressImageFile(file: File): Promise<File> {
-  if (file.type === "image/gif" || file.size <= IMAGE_COMPRESS_TARGET_BYTES) {
-    return file;
-  }
-
-  const bitmap = await createImageBitmap(file);
-  const { width, height } = bitmap;
-  const maxDim = Math.max(width, height);
-  const scale = maxDim > IMAGE_COMPRESS_MAX_PX ? IMAGE_COMPRESS_MAX_PX / maxDim : 1;
-  const targetW = Math.round(width * scale);
-  const targetH = Math.round(height * scale);
-
-  let blob: Blob | null = null;
-
-  if (typeof OffscreenCanvas !== "undefined") {
-    const offscreen = new OffscreenCanvas(targetW, targetH);
-    const ctx = offscreen.getContext("2d");
-    if (ctx) {
-      ctx.drawImage(bitmap, 0, 0, targetW, targetH);
-      blob = await offscreen.convertToBlob({
-        type: "image/jpeg",
-        quality: IMAGE_COMPRESS_QUALITY,
-      });
-    }
-  }
-
-  if (!blob) {
-    const canvas = document.createElement("canvas");
-    canvas.width = targetW;
-    canvas.height = targetH;
-    const ctx = canvas.getContext("2d");
-    if (ctx) {
-      ctx.drawImage(bitmap, 0, 0, targetW, targetH);
-      blob = await new Promise<Blob | null>((resolve) =>
-        canvas.toBlob(resolve, "image/jpeg", IMAGE_COMPRESS_QUALITY),
-      );
-    }
-  }
-
-  bitmap.close();
-
-  if (!blob || blob.size >= file.size) {
-    return file;
-  }
-
-  const stem = file.name.replace(/\.[^.]+$/, "") || "image";
-  return new File([blob], `${stem}.jpg`, { type: "image/jpeg" });
 }
 
 function formatMcpStatusLabel(status: McpServerStatus | undefined) {
@@ -417,14 +367,14 @@ export function ReactSessionComposer(props: ComposerProps) {
   const handleEditorSubmit = useCallback((options: { queue: boolean }) => {
     const hasContent = props.draft.trim().length > 0 || props.attachments.length > 0;
     if (!hasContent) return;
-    if (props.submissionPreparing || props.submissionBlocked) return;
+    if (props.submissionPreparing) return;
     if (props.busy) {
       if (options.queue) void props.onQueue();
       else void props.onSteer();
       return;
     }
     void props.onSend();
-  }, [props.busy, props.draft, props.attachments, props.onSend, props.onSteer, props.onQueue, props.submissionBlocked, props.submissionPreparing]);
+  }, [props.busy, props.draft, props.attachments, props.onSend, props.onSteer, props.onQueue, props.submissionPreparing]);
 
   const slashCommandQuery = getSlashCommandQuery(props.draft);
   const slashOpenNext = slashCommandQuery !== null;
@@ -1089,6 +1039,14 @@ export function ReactSessionComposer(props: ComposerProps) {
     }
   };
 
+  // Attachment chips are raw Lexical token DOM, so their uploading overlay is
+  // synced by attribute whenever the uploading flag or the chip set changes.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    syncAttachmentChipStatus(root, props.attachmentsUploading ? "uploading" : "ready");
+  }, [props.attachmentsUploading, props.attachments]);
+
   const addAttachments = async (inputFiles: File[]) => {
     if (!inputFiles.length) return;
     if (!props.attachmentsEnabled) {
@@ -1098,14 +1056,9 @@ export function ReactSessionComposer(props: ComposerProps) {
 
     // No client-side size cap: oversized files are rejected upstream (upload
     // endpoint or provider) with their own errors instead of a composer rule.
-    const accepted: File[] = [];
-    for (const original of inputFiles) {
-      accepted.push(original.type.startsWith("image/") ? await compressImageFile(original) : original);
-    }
-
-    if (accepted.length) {
-      props.onAttachFiles(accepted);
-    }
+    // Oversized images are compressed at send time (see image-compression.ts)
+    // so the chip appears instantly instead of blocking on canvas work here.
+    props.onAttachFiles(inputFiles);
   };
 
   const activeMcpItems = mcpServers.map((entry) => ({
@@ -1228,7 +1181,7 @@ export function ReactSessionComposer(props: ComposerProps) {
   return (
     <div
       ref={rootRef}
-      className={props.flush ? `relative ${toolMenuOpen ? "z-50" : "z-20"}` : `sticky bottom-0 ${toolMenuOpen ? "z-50" : "z-20"} bg-gradient-to-t from-dls-surface via-dls-surface/95 to-transparent px-4 pb-2 md:px-8 ${props.compactTopSpacing ? "pt-0" : "pt-1"}`}
+      className={props.flush ? `relative ${toolMenuOpen ? "z-50" : "z-20"}` : `sticky bottom-0 ${toolMenuOpen ? "z-50" : "z-20"} bg-gradient-to-t from-dls-surface via-dls-surface/95 to-transparent px-4 pb-[max(0.5rem,calc(env(safe-area-inset-bottom)+var(--keyboard-inset,0px)))] max-lg:px-3 lg:px-8 ${props.compactTopSpacing ? "pt-0" : "pt-1"}`}
       style={{ contain: "layout style" }}
       onKeyDownCapture={handleKeyDownCapture}
       onCompositionStart={() => {
@@ -1265,126 +1218,102 @@ export function ReactSessionComposer(props: ComposerProps) {
             </div>
           ) : null}
 
-          <div
-            className="px-4 pt-3 pb-2"
-            aria-busy={props.submissionPreparing}
-          >
+          <div className="px-4 pt-3 pb-2">
             {/* Editor */}
-            <div className="relative">
-              <div className={props.submissionBlocked ? "invisible" : undefined}>
-                <LexicalPromptEditor
-                  ref={editorRef}
-                  value={props.draft}
-                  mentions={props.mentions}
-                  pastedText={pastedTextTokens}
-                  attachments={props.attachments.map((attachment) => ({
-                    id: attachment.id,
-                    name: attachment.name,
-                    kind: isImageAttachment(attachment) ? "image" : "file",
-                    previewUrl: attachment.previewUrl,
-                  }))}
-                  disabled={props.disabled || props.submissionBlocked}
-                  placeholder={t("composer.placeholder")}
-                  onChange={props.onDraftChange}
-                  onSubmit={handleEditorSubmit}
-                  onExpandPastedText={handleExpandPastedText}
-                  onRemoveAttachment={props.onRemoveAttachment}
-                  onPasteText={props.onPasteText}
-                  onPaste={(event) => {
-                    // Paste policy:
-                    // 1. Actual files on the clipboard -> attach them.
-                    // 2. Explicit text/uri-list (drag from Finder / browser) -> insert links.
-                    // 3. Plain text -> DO NOTHING. Let Lexical's PlainTextPlugin
-                    //    handle the paste natively so newlines render correctly
-                    //    and no content is silently dropped. Previous behavior
-                    //    hijacked pastes that merely contained absolute paths
-                    //    like "/Users/..." or pastes longer than 10 lines, which
-                    //    was the root cause of "paste into composer is broken".
-                    const files = Array.from(event.clipboardData?.files ?? []);
-                    if (files.length) {
-                      event.preventDefault();
-                      void addAttachments(files);
-                      return;
-                    }
+            <LexicalPromptEditor
+              ref={editorRef}
+              value={props.draft}
+              mentions={props.mentions}
+              pastedText={pastedTextTokens}
+              attachments={props.attachments.map((attachment) => ({
+                id: attachment.id,
+                name: attachment.name,
+                kind: isImageAttachment(attachment) ? "image" : "file",
+                previewUrl: attachment.previewUrl,
+              }))}
+              disabled={props.disabled}
+              placeholder={t("composer.placeholder")}
+              onChange={props.onDraftChange}
+              onSubmit={handleEditorSubmit}
+              onExpandPastedText={handleExpandPastedText}
+              onRemoveAttachment={props.onRemoveAttachment}
+              onPasteText={props.onPasteText}
+              onPaste={(event) => {
+                // Paste policy:
+                // 1. Actual files on the clipboard -> attach them.
+                // 2. Explicit text/uri-list (drag from Finder / browser) -> insert links.
+                // 3. Plain text -> DO NOTHING. Let Lexical's PlainTextPlugin
+                //    handle the paste natively so newlines render correctly
+                //    and no content is silently dropped. Previous behavior
+                //    hijacked pastes that merely contained absolute paths
+                //    like "/Users/..." or pastes longer than 10 lines, which
+                //    was the root cause of "paste into composer is broken".
+                const files = Array.from(event.clipboardData?.files ?? []);
+                if (files.length) {
+                  event.preventDefault();
+                  void addAttachments(files);
+                  return;
+                }
 
-                    const uriList = event.clipboardData
-                      ? parseClipboardUriList(event.clipboardData)
-                      : [];
-                    if (uriList.length) {
-                      event.preventDefault();
-                      props.onUnsupportedFileLinks(uriList);
-                      return;
-                    }
+                const uriList = event.clipboardData
+                  ? parseClipboardUriList(event.clipboardData)
+                  : [];
+                if (uriList.length) {
+                  event.preventDefault();
+                  props.onUnsupportedFileLinks(uriList);
+                  return;
+                }
 
-                    const text = event.clipboardData?.getData("text/plain") ?? "";
+                const text = event.clipboardData?.getData("text/plain") ?? "";
 
-                    // Plain text paste display is owned by PasteChipPlugin inside
-                    // the Lexical editor: text collapses when it would exceed the
-                    // editor's current width and maximum height, unless the whole
-                    // string is a standalone HTTP(S) URL. Text that fits, or is
-                    // expanded from a chip, renders like normal text. Do NOT
-                    // duplicate that here.
+                // Plain text paste display is owned by PasteChipPlugin inside
+                // the Lexical editor: text collapses when it would exceed the
+                // editor's current width and maximum height, unless the whole
+                // string is a standalone HTTP(S) URL. Text that fits, or is
+                // expanded from a chip, renders like normal text. Do NOT
+                // duplicate that here.
 
-                    if (
-                      text.trim() &&
-                      (props.isRemoteWorkspace || props.isSandboxWorkspace) &&
-                      /file:\/\/|(^|\s)\/(Users|home|var|etc|opt|tmp|private|Volumes|Applications)\//.test(text)
-                    ) {
-                      const attachedFiles = props.attachments.map((attachment) => attachment.file);
-                      toast.warning(t("composer.remote_worker_paste_warning"), {
-                        action:
-                          props.onUploadInboxFiles && attachedFiles.length > 0
-                            ? {
-                                label: t("composer.upload_to_shared_folder"),
-                                onClick: () => void props.onUploadInboxFiles?.(attachedFiles),
-                              }
-                            : undefined,
-                      });
-                      // Intentionally no preventDefault — the notice is advisory,
-                      // the paste still goes through the editor.
-                    }
-                  }}
-                  onDragOver={(event) => {
-                    if (event.dataTransfer?.files?.length) {
-                      event.preventDefault();
-                      if (!dropzoneActive) setDropzoneActive(true);
-                    }
-                  }}
-                  onDragLeave={(event) => {
-                    const nextTarget = event.relatedTarget;
-                    if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
-                    setDropzoneActive(false);
-                  }}
-                  onDrop={(event) => {
-                    const files = Array.from(event.dataTransfer?.files ?? []);
-                    setDropzoneActive(false);
-                    if (!files.length) return;
-                    event.preventDefault();
-                    void addAttachments(files);
-                  }}
-                />
-              </div>
-              {props.submissionBlocked ? (
-                <div
-                  className="absolute inset-0 flex min-h-[60px] items-center justify-center gap-2 text-[13px] font-medium text-dls-secondary"
-                  data-testid="composer-connection-state"
-                  role="status"
-                  aria-live="polite"
-                >
-                  {props.submissionPreparing ? (
-                    <>
-                      <LoaderCircle size={15} className="animate-spin" />
-                      <span>{props.submissionInputStatusLabel ?? "Connecting signed-in services…"}</span>
-                    </>
-                  ) : (
-                    <span>Reconnect Den to continue.</span>
-                  )}
-                </div>
-              ) : null}
-            </div>
+                if (
+                  text.trim() &&
+                  (props.isRemoteWorkspace || props.isSandboxWorkspace) &&
+                  /file:\/\/|(^|\s)\/(Users|home|var|etc|opt|tmp|private|Volumes|Applications)\//.test(text)
+                ) {
+                  const attachedFiles = props.attachments.map((attachment) => attachment.file);
+                  toast.warning(t("composer.remote_worker_paste_warning"), {
+                    action:
+                      props.onUploadInboxFiles && attachedFiles.length > 0
+                        ? {
+                            label: t("composer.upload_to_shared_folder"),
+                            onClick: () => void props.onUploadInboxFiles?.(attachedFiles),
+                          }
+                        : undefined,
+                  });
+                  // Intentionally no preventDefault — the notice is advisory,
+                  // the paste still goes through the editor.
+                }
+              }}
+              onDragOver={(event) => {
+                if (event.dataTransfer?.files?.length) {
+                  event.preventDefault();
+                  if (!dropzoneActive) setDropzoneActive(true);
+                }
+              }}
+              onDragLeave={(event) => {
+                const nextTarget = event.relatedTarget;
+                if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+                setDropzoneActive(false);
+              }}
+              onDrop={(event) => {
+                const files = Array.from(event.dataTransfer?.files ?? []);
+                setDropzoneActive(false);
+                if (!files.length) return;
+                event.preventDefault();
+                void addAttachments(files);
+              }}
+            />
 
             {/* Action row — attachments, quick actions, model controls, and send */}
-            <div className="mt-2 flex flex-wrap items-end justify-between gap-2">
+            <div className="mt-2 flex flex-wrap items-end justify-between gap-2 max-lg:gap-y-3">
               <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
                 <input
                   ref={(element) => {
@@ -1401,7 +1330,7 @@ export function ReactSessionComposer(props: ComposerProps) {
                 />
                 <button
                   type="button"
-                  className={`inline-flex h-9 max-h-9 w-9 items-center justify-center rounded-md text-gray-10 transition-colors hover:bg-gray-3 ${
+                  className={`inline-flex h-9 max-h-9 w-9 items-center justify-center rounded-md text-gray-10 transition-colors hover:bg-gray-3 max-lg:h-11 max-lg:max-h-11 max-lg:w-11 ${
                     !props.attachmentsEnabled ? "cursor-not-allowed opacity-60" : ""
                   }`}
                   onClick={() => {
@@ -1423,7 +1352,7 @@ export function ReactSessionComposer(props: ComposerProps) {
                 >
                   <button
                     type="button"
-                    className={`inline-flex h-9 max-h-9 w-9 items-center justify-center rounded-md transition-colors ${toolMenuOpen ? "bg-gray-3 text-gray-12" : "text-gray-10 hover:bg-gray-3"}`}
+                    className={`inline-flex h-9 max-h-9 w-9 items-center justify-center rounded-md transition-colors max-lg:h-11 max-lg:max-h-11 max-lg:w-11 ${toolMenuOpen ? "bg-gray-3 text-gray-12" : "text-gray-10 hover:bg-gray-3"}`}
                     onClick={() => {
                       setMentionOpen(false);
                       setMentionItems([]);
@@ -1444,7 +1373,7 @@ export function ReactSessionComposer(props: ComposerProps) {
                             ["agents", t("composer.agents_label")],
                             ["commands", t("dashboard.commands")],
                             ["skills", t("dashboard.skills")],
-                            ["extensions", "Extensions"],
+                            ["extensions", "Library"],
                           ] as const).map(([section, label]) => (
                             <button
                               key={section}
@@ -1640,7 +1569,7 @@ export function ReactSessionComposer(props: ComposerProps) {
                                 <div className="px-3 py-2 text-xs text-gray-10">
                                   {!mcpLoaded && mcpLoading
                                     ? t("composer.loading_commands")
-                                    : (mcpStatus ?? "No extensions enabled. Open Extensions to enable them.")}
+                                    : (mcpStatus ?? "No library items enabled. Open Library to enable them.")}
                                 </div>
                               ) : null}
                             </>
@@ -1759,6 +1688,8 @@ export function ReactSessionComposer(props: ComposerProps) {
                   disabled={props.steering}
                   sessionId={props.sessionId}
                   openWorkModelsEntitled={props.openWorkModelsEntitled}
+                  openWorkModelsSyncing={props.openWorkModelsSyncing}
+                  fallbackOptions={props.modelOptions}
                 />
                 {props.modelUnavailable ? props.onRefreshOrganizationModels ? (
                   <button
@@ -1804,18 +1735,18 @@ export function ReactSessionComposer(props: ComposerProps) {
                   on the chevron shows how many messages are queued.
                   Escape arms a "Hit Escape again to stop the agent" prompt.
               */}
-              <div className="ml-auto flex shrink-0 items-end gap-1.5">
+              <div className="ml-auto flex shrink-0 items-end gap-1.5 max-lg:w-full max-lg:justify-end">
                 {props.busy ? (
                   <>
                     {escapeArmed ? (
-                      <span className="self-center pr-1 text-[12px] font-medium text-gray-10">
+                      <span className="self-center pr-1 text-[12px] font-medium text-gray-10 max-lg:hidden">
                         {t("composer.escape_to_stop")}
                       </span>
                     ) : null}
                     <button
                       type="button"
                       onClick={props.onStop}
-                      className="mr-2 inline-flex h-9 max-h-9 items-center gap-2 rounded-full border border-dls-border bg-transparent px-4 text-[13px] font-medium text-gray-11 transition-colors hover:bg-gray-3"
+                      className="mr-2 inline-flex h-9 max-h-9 items-center gap-2 rounded-full border border-dls-border bg-transparent px-4 text-[13px] font-medium text-gray-11 transition-colors hover:bg-gray-3 max-lg:h-11 max-lg:max-h-11"
                       title={t("composer.stop")}
                     >
                       <Square size={12} fill="currentColor" />
@@ -1824,10 +1755,10 @@ export function ReactSessionComposer(props: ComposerProps) {
                     <div className="flex items-end">
                       <button
                         type="button"
-                        onClick={canSend && !props.submissionBlocked ? props.onSteer : undefined}
-                        disabled={!canSend || props.submissionBlocked}
-                        className={`inline-flex h-9 max-h-9 items-center gap-2 rounded-l-full pl-4 pr-3 text-[13px] font-medium transition-colors ${
-                          canSend && !props.submissionBlocked
+                        onClick={canSend ? props.onSteer : undefined}
+                        disabled={!canSend}
+                        className={`inline-flex h-9 max-h-9 items-center gap-2 rounded-l-full pl-4 pr-3 text-[13px] font-medium transition-colors max-lg:h-11 max-lg:max-h-11 ${
+                          canSend
                             ? "bg-[var(--dls-accent)] text-[var(--dls-accent-fg)] hover:bg-[var(--dls-accent-hover)]"
                             : "bg-gray-4 text-gray-10"
                         }`}
@@ -1842,9 +1773,8 @@ export function ReactSessionComposer(props: ComposerProps) {
                             <button
                               type="button"
                               aria-label={t("composer.send_options")}
-                              disabled={props.submissionBlocked}
-                              className={`relative inline-flex h-9 max-h-9 items-center rounded-r-full border-l pl-1.5 pr-2.5 transition-colors ${
-                                canSend && !props.submissionBlocked
+                              className={`relative inline-flex h-9 max-h-9 items-center rounded-r-full border-l pl-1.5 pr-2.5 transition-colors max-lg:h-11 max-lg:max-h-11 ${
+                                canSend
                                   ? "border-[color-mix(in_srgb,var(--dls-accent-fg)_25%,transparent)] bg-[var(--dls-accent)] text-[var(--dls-accent-fg)] hover:bg-[var(--dls-accent-hover)]"
                                   : "border-gray-6 bg-gray-4 text-gray-10"
                               }`}
@@ -1860,7 +1790,7 @@ export function ReactSessionComposer(props: ComposerProps) {
                         />
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem
-                            disabled={!canSend || props.submissionBlocked}
+                            disabled={!canSend}
                             onClick={() => void props.onQueue()}
                             title={t("composer.queue_hint")}
                           >
@@ -1879,21 +1809,17 @@ export function ReactSessionComposer(props: ComposerProps) {
                 ) : (
                   <button
                     type="button"
-                    onClick={canSend && !props.submissionBlocked ? props.onSend : undefined}
-                    disabled={props.disabled || !canSend || props.submissionBlocked}
-                    className={`inline-flex h-9 max-h-9 items-center gap-2 rounded-full px-4 text-[13px] font-medium transition-colors ${
-                      !canSend || props.disabled || props.submissionBlocked
+                    onClick={canSend && !props.submissionPreparing ? props.onSend : undefined}
+                    disabled={props.disabled || !canSend || props.submissionPreparing}
+                    className={`inline-flex h-9 max-h-9 items-center gap-2 rounded-full px-4 text-[13px] font-medium transition-colors max-lg:h-11 max-lg:max-h-11 ${
+                      !canSend || props.disabled || props.submissionPreparing
                         ? "bg-gray-4 text-gray-10"
                         : "bg-[var(--dls-accent)] text-[var(--dls-accent-fg)] hover:bg-[var(--dls-accent-hover)]"
                     }`}
-                    title={props.submissionPreparing
-                      ? "Connecting signed-in services…"
-                      : props.submissionBlocked
-                        ? "Reconnect Den before running this task."
-                        : t("composer.run_task")}
+                    title={props.submissionPreparing ? "Preparing connected service tools…" : t("composer.run_task")}
                   >
                     {props.submissionPreparing ? <LoaderCircle size={15} className="animate-spin" /> : <ArrowUp size={15} />}
-                    <span>{props.submissionPreparing ? "Connecting services…" : t("composer.run_task")}</span>
+                    <span>{props.submissionPreparing ? "Preparing connected service tools…" : t("composer.run_task")}</span>
                   </button>
                 )}
               </div>
