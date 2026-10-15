@@ -10,7 +10,8 @@ import {
 } from "@openwork/enterprise-mcp-client"
 import { env } from "../env.js"
 import { createGuardedFetch, createRealmSafeFetch } from "./url-guard.js"
-import type { ExternalMcpConnectionRow } from "./external-mcp-connections.js"
+import { memberApiKeyStillCurrent, rejectMemberApiKey, resolveMemberApiKey, type ExternalMcpConnectionRow } from "./external-mcp-connections.js"
+import { memberApiKeyAuthorization, usesMemberApiKey } from "./member-api-key.js"
 import {
   EXTERNAL_MCP_TOOL_CALL_TIMEOUT_MS,
   type ExternalMcpLifecycleDeadline,
@@ -32,9 +33,13 @@ import {
   type ExternalMcpToolCallInspector,
 } from "./external-mcp-tool-inspection.js"
 
+type MemberApiKeyCredential = Awaited<ReturnType<typeof resolveMemberApiKey>>
+
 function toEnterpriseConnection(
   connection: ExternalMcpConnectionRow,
-  member?: ExternalMcpMemberContext,
+  member: ExternalMcpMemberContext | undefined,
+  tracker: ExternalMcpDiagnosticTracker,
+  memberApiKey: MemberApiKeyCredential | undefined,
 ): EnterpriseMcpConnection {
   if (connection.kind !== "external_mcp") {
     throw new Error("Native provider connectors do not expose an MCP server.")
@@ -46,7 +51,7 @@ function toEnterpriseConnection(
       serverUrl: connection.url,
       authorization: {
         type: "oauth",
-        persistence: new DenEnterpriseMcpOAuthPersistence(connection, member),
+        persistence: new DenEnterpriseMcpOAuthPersistence(connection, member, tracker),
         configuration: {
           applicationType: "web",
           // CIMD client identifiers must be HTTPS URLs. Local HTTP development
@@ -65,11 +70,15 @@ function toEnterpriseConnection(
     }
   }
   if (connection.authType === "apikey") {
+    if (connection.credentialMode === "per_member") {
+      if (!memberApiKey) throw new Error("A member identity is required for this connection.")
+      return { id: connection.id, serverUrl: connection.url, authorization: { type: "api-key", token: memberApiKey.key, scheme: connection.apiKeyAuthScheme } }
+    }
     if (!connection.apiKey) throw new Error(`Connection "${connection.id}" does not have an API key.`)
     return {
       id: connection.id,
       serverUrl: connection.url,
-      authorization: { type: "api-key", token: connection.apiKey },
+      authorization: { type: "api-key", token: connection.apiKey, scheme: connection.apiKeyAuthScheme },
     }
   }
   return {
@@ -87,7 +96,7 @@ function diagnosticPhase(event: EnterpriseMcpDiagnosticEvent): ExternalMcpDiagno
   if (event.requestPhase === "oauth-client-registration") return "AUTH_CLIENT_REGISTRATION"
   if (event.requestPhase === "oauth-token-exchange") return "AUTH_TOKEN_ACQUISITION"
   if (event.requestPhase === "oauth-token-refresh") return "CONTINUITY_REFRESH"
-  if (event.requestPhase === "mcp-initialize") return "MCP_INITIALIZE"
+  if (event.requestPhase === "mcp-discovery" || event.requestPhase === "mcp-initialize") return "MCP_INITIALIZE"
   if (event.requestPhase === "mcp-tool-discovery") return "MCP_TOOL_DISCOVERY"
   if (event.requestPhase === "mcp-tool-execution") return "MCP_TOOL_EXECUTION"
   if (event.requestPhase === "mcp-resource-discovery" || event.requestPhase === "mcp-resource-read") return "MCP_TOOL_DISCOVERY"
@@ -106,18 +115,9 @@ function diagnosticSink(tracker: ExternalMcpDiagnosticTracker) {
     // authorization challenges and network causes. Package request events are
     // still available to package consumers, but must not overwrite that richer
     // Den evidence after a response settles.
-    if (event.kind === "request") return
-    if (event.kind === "credential-invalidation") {
-      console.error("external_mcp_credential_invalidated", {
-        referenceId: tracker.referenceId,
-        connectionId: event.connectionId,
-        operationPhase: event.operationPhase,
-        requestPhase: event.requestPhase,
-        httpStatus: event.httpStatus,
-        invalidToken: event.invalidToken,
-      })
-      return
-    }
+    // The persistence boundary logs committed invalidations, including SDK
+    // paths that do not emit the package event. Do not log them twice here.
+    if (event.kind === "request" || event.kind === "credential-invalidation") return
     const phase = diagnosticPhase(event)
     if (event.outcome === "started") {
       tracker.begin(phase)
@@ -129,7 +129,14 @@ function diagnosticSink(tracker: ExternalMcpDiagnosticTracker) {
       // operation catch boundary below.
       return
     }
-    if (event.kind === "operation" && event.requestPhase === "mcp-initialize") {
+    // A successful protocol negotiation reports the era it settled on; the
+    // final request phase differs by era (server/discover on the modern wire,
+    // initialize plus notifications/initialized on the legacy fallback).
+    if (event.kind === "operation" && (
+      event.protocolEra !== undefined
+      || event.requestPhase === "mcp-discovery"
+      || event.requestPhase === "mcp-initialize"
+    )) {
       tracker.passed("MCP_INITIALIZED", "protocol_ready")
       return
     }
@@ -170,7 +177,10 @@ function translateEnterpriseMcpError(
   if (toolResult instanceof EnterpriseMcpToolResultError) {
     return providerToolDiagnosticError({
       tracker,
-      result: toolResult.providerSignal ? { structuredContent: toolResult.providerSignal } : undefined,
+      result: {
+        content: toolResult.providerText.map((text) => ({ type: "text", text })),
+        ...(toolResult.providerSignal ? { structuredContent: toolResult.providerSignal } : {}),
+      },
     })
   }
   const enterpriseError = chain.find((cause) => cause instanceof EnterpriseMcpClientError)
@@ -191,52 +201,77 @@ function translateEnterpriseMcpError(
   return tracker.error(source, phase)
 }
 
-function createOperationClient(input: {
+type OperationInput = {
   connection: ExternalMcpConnectionRow
+  member?: ExternalMcpMemberContext
   diagnosticReferenceId?: string
   lifecycleDeadline?: ExternalMcpLifecycleDeadline
   operationTimeoutMs?: number
   toolCallInspector?: ExternalMcpToolCallInspector
-}): { client: EnterpriseMcpClient; tracker: ExternalMcpDiagnosticTracker } {
-  const tracker = new ExternalMcpDiagnosticTracker(input.diagnosticReferenceId ?? randomUUID(), {
-    authType: input.connection.authType,
-    credentialMode: input.connection.credentialMode,
-  })
+}
+
+function createOperationClient(
+  input: OperationInput,
+  tracker: ExternalMcpDiagnosticTracker,
+  memberApiKey: MemberApiKeyCredential | undefined,
+): EnterpriseMcpClient {
+  const member = input.member
+  const fetchForCaller: typeof guardedFetch = memberApiKey && member
+    ? async (resource, init) => {
+      const credential = memberApiKey
+      // Authorization ran once for the operation; each request only re-reads
+      // the stored key, so a replaced or rejected key stops the operation here.
+      if (!await memberApiKeyStillCurrent(input.connection, member.orgMembershipId, credential)) {
+        throw new Error("Connect your personal API key in Your Connections.")
+      }
+      const request = new Request(resource, init)
+      // Never forward a personal token to a discovery URL or redirect target.
+      if (request.url !== new URL(input.connection.url).href || request.headers.get("authorization") !== memberApiKeyAuthorization(credential.key, input.connection.apiKeyAuthScheme)) {
+        throw new Error("Connection credentials or destination changed. Reconnect and retry.")
+      }
+      const response = await guardedFetch(resource, { ...init, redirect: "error" })
+      if (response.status === 401) await rejectMemberApiKey(input.connection, member.orgMembershipId, credential)
+      return response
+    }
+    : guardedFetch
   const diagnosticFetch = createExternalMcpDiagnosticFetch({
-    fetch: guardedFetch,
+    fetch: fetchForCaller,
     endpoint: input.connection.url,
     tracker,
   })
   const observedFetch = input.toolCallInspector
     ? input.toolCallInspector.observeFetch(diagnosticFetch)
     : diagnosticFetch
-  return {
-    tracker,
-    client: createEnterpriseMcpClient({
-      fetch: observedFetch,
-      diagnosticSink: diagnosticSink(tracker),
-      ...(input.operationTimeoutMs ? { operationTimeoutMs: input.operationTimeoutMs } : {}),
-      ...(input.lifecycleDeadline ? {
-        lifecycle: {
-          expiresAt: input.lifecycleDeadline.expiresAt,
-          signal: input.lifecycleDeadline.signal,
-        },
-      } : {}),
-    }),
-  }
+  return createEnterpriseMcpClient({
+    fetch: observedFetch,
+    diagnosticSink: diagnosticSink(tracker),
+    ...(input.operationTimeoutMs ? { operationTimeoutMs: input.operationTimeoutMs } : {}),
+    ...(input.lifecycleDeadline ? {
+      lifecycle: {
+        expiresAt: input.lifecycleDeadline.expiresAt,
+        signal: input.lifecycleDeadline.signal,
+      },
+    } : {}),
+  })
 }
 
-async function runEnterpriseMcpOperation<T>(input: {
-  connection: ExternalMcpConnectionRow
-  diagnosticReferenceId?: string
-  lifecycleDeadline?: ExternalMcpLifecycleDeadline
-  operationTimeoutMs?: number
-  toolCallInspector?: ExternalMcpToolCallInspector
-  operation: (client: EnterpriseMcpClient) => Promise<T>
+async function runEnterpriseMcpOperation<T>(input: OperationInput & {
+  operation: (client: EnterpriseMcpClient, connection: EnterpriseMcpConnection) => Promise<T>
 }): Promise<T> {
-  const { client, tracker } = createOperationClient(input)
+  const tracker = new ExternalMcpDiagnosticTracker(input.diagnosticReferenceId ?? randomUUID(), {
+    authType: input.connection.authType,
+    credentialMode: input.connection.credentialMode,
+  })
   try {
-    return await input.operation(client)
+    // A personal key is authorized and read once per operation; every request
+    // of the operation must then carry exactly that key to exactly this URL.
+    let memberApiKey: MemberApiKeyCredential | undefined
+    if (usesMemberApiKey(input.connection)) {
+      if (!input.member) throw new Error("A member identity is required for this connection.")
+      memberApiKey = await resolveMemberApiKey(input.connection, input.member.orgMembershipId)
+    }
+    const client = createOperationClient(input, tracker, memberApiKey)
+    return await input.operation(client, toEnterpriseConnection(input.connection, input.member, tracker, memberApiKey))
   } catch (error) {
     throw translateEnterpriseMcpError(error, tracker)
   }
@@ -251,9 +286,10 @@ export async function connectExternalMcp(
 ): Promise<ExternalMcpConnectResult> {
   return runEnterpriseMcpOperation({
     connection,
+    member,
     diagnosticReferenceId,
-    operation: (client) => client.connect({
-      connection: toEnterpriseConnection(connection, member),
+    operation: (client, connection) => client.connect({
+      connection,
       redirectUri,
       authorizationId: signedState,
     }),
@@ -267,16 +303,19 @@ export async function completeExternalMcpAuth(
   member?: ExternalMcpMemberContext,
   diagnosticReferenceId?: string,
   signedState?: string,
+  responseIssuer?: string,
 ): Promise<void> {
   if (!signedState) throw new Error("The enterprise MCP OAuth callback requires its signed state transaction.")
   await runEnterpriseMcpOperation({
     connection,
+    member,
     diagnosticReferenceId,
-    operation: (client) => client.completeAuthorization({
-      connection: toEnterpriseConnection(connection, member),
+    operation: (client, connection) => client.completeAuthorization({
+      connection,
       redirectUri,
       code,
       authorizationId: signedState,
+      responseIssuer,
     }),
   })
 }
@@ -289,9 +328,10 @@ export async function abandonExternalMcpAuth(
 ): Promise<void> {
   await runEnterpriseMcpOperation({
     connection,
+    member,
     diagnosticReferenceId,
-    operation: (client) => client.abandonAuthorization({
-      connection: toEnterpriseConnection(connection, member),
+    operation: (client, connection) => client.abandonAuthorization({
+      connection,
       authorizationId: signedState,
       reason: "provider-rejected",
     }),
@@ -304,13 +344,16 @@ export async function listExternalMcpTools(
   member?: ExternalMcpMemberContext,
   diagnosticReferenceId?: string,
   lifecycleDeadline?: ExternalMcpLifecycleDeadline,
+  operationTimeoutMs?: number,
 ) {
   return runEnterpriseMcpOperation({
     connection,
+    member,
     diagnosticReferenceId,
     lifecycleDeadline,
-    operation: (client) => client.listTools({
-      connection: toEnterpriseConnection(connection, member),
+    operationTimeoutMs,
+    operation: (client, connection) => client.listTools({
+      connection,
       redirectUri,
     }),
   })
@@ -332,12 +375,13 @@ function runExternalMcpToolCall(
 ) {
   return runEnterpriseMcpOperation({
     connection: input.connection,
+    member: input.member,
     diagnosticReferenceId: input.diagnosticReferenceId,
     lifecycleDeadline: input.lifecycleDeadline,
     operationTimeoutMs: EXTERNAL_MCP_TOOL_CALL_TIMEOUT_MS,
     toolCallInspector,
-    operation: (client) => client.callTool({
-      connection: toEnterpriseConnection(input.connection, input.member),
+    operation: (client, connection) => client.callTool({
+      connection,
       redirectUri: input.redirectUri,
       toolName: input.toolName,
       arguments: input.args,
@@ -349,14 +393,35 @@ export function callExternalMcpTool(input: ExternalMcpToolCallInput) {
   return runExternalMcpToolCall(input)
 }
 
-export function callExternalMcpToolRaw(input: ExternalMcpToolCallInput) {
+/** Lists the provider's tools and calls one in a single session; beforeCall can refuse in between. */
+export function callListedExternalMcpTool(input: ExternalMcpToolCallInput & {
+  beforeCall: (tools: Awaited<ReturnType<typeof listExternalMcpTools>>) => void | Promise<void>
+}) {
   return runEnterpriseMcpOperation({
     connection: input.connection,
+    member: input.member,
     diagnosticReferenceId: input.diagnosticReferenceId,
     lifecycleDeadline: input.lifecycleDeadline,
     operationTimeoutMs: EXTERNAL_MCP_TOOL_CALL_TIMEOUT_MS,
-    operation: (client) => client.callToolRaw({
-      connection: toEnterpriseConnection(input.connection, input.member),
+    operation: (client, connection) => client.callListedTool({
+      connection,
+      redirectUri: input.redirectUri,
+      toolName: input.toolName,
+      arguments: input.args,
+      beforeCall: input.beforeCall,
+    }),
+  })
+}
+
+export function callExternalMcpToolRaw(input: ExternalMcpToolCallInput) {
+  return runEnterpriseMcpOperation({
+    connection: input.connection,
+    member: input.member,
+    diagnosticReferenceId: input.diagnosticReferenceId,
+    lifecycleDeadline: input.lifecycleDeadline,
+    operationTimeoutMs: EXTERNAL_MCP_TOOL_CALL_TIMEOUT_MS,
+    operation: (client, connection) => client.callToolRaw({
+      connection,
       redirectUri: input.redirectUri,
       toolName: input.toolName,
       arguments: input.args,
@@ -375,10 +440,11 @@ type ExternalMcpResourceInput = {
 export function describeExternalMcpServer(input: ExternalMcpResourceInput) {
   return runEnterpriseMcpOperation({
     connection: input.connection,
+    member: input.member,
     diagnosticReferenceId: input.diagnosticReferenceId,
     lifecycleDeadline: input.lifecycleDeadline,
-    operation: (client) => client.describeServer({
-      connection: toEnterpriseConnection(input.connection, input.member),
+    operation: (client, connection) => client.describeServer({
+      connection,
       redirectUri: input.redirectUri,
     }),
   })
@@ -387,10 +453,11 @@ export function describeExternalMcpServer(input: ExternalMcpResourceInput) {
 export function listExternalMcpResources(input: ExternalMcpResourceInput) {
   return runEnterpriseMcpOperation({
     connection: input.connection,
+    member: input.member,
     diagnosticReferenceId: input.diagnosticReferenceId,
     lifecycleDeadline: input.lifecycleDeadline,
-    operation: (client) => client.listResources({
-      connection: toEnterpriseConnection(input.connection, input.member),
+    operation: (client, connection) => client.listResources({
+      connection,
       redirectUri: input.redirectUri,
     }),
   })
@@ -399,10 +466,11 @@ export function listExternalMcpResources(input: ExternalMcpResourceInput) {
 export function listExternalMcpResourceTemplates(input: ExternalMcpResourceInput) {
   return runEnterpriseMcpOperation({
     connection: input.connection,
+    member: input.member,
     diagnosticReferenceId: input.diagnosticReferenceId,
     lifecycleDeadline: input.lifecycleDeadline,
-    operation: (client) => client.listResourceTemplates({
-      connection: toEnterpriseConnection(input.connection, input.member),
+    operation: (client, connection) => client.listResourceTemplates({
+      connection,
       redirectUri: input.redirectUri,
     }),
   })
@@ -411,10 +479,11 @@ export function listExternalMcpResourceTemplates(input: ExternalMcpResourceInput
 export function readExternalMcpResource(input: ExternalMcpResourceInput & { uri: string }) {
   return runEnterpriseMcpOperation({
     connection: input.connection,
+    member: input.member,
     diagnosticReferenceId: input.diagnosticReferenceId,
     lifecycleDeadline: input.lifecycleDeadline,
-    operation: (client) => client.readResource({
-      connection: toEnterpriseConnection(input.connection, input.member),
+    operation: (client, connection) => client.readResource({
+      connection,
       redirectUri: input.redirectUri,
       uri: input.uri,
     }),

@@ -1,22 +1,28 @@
-import { serve } from "@hono/node-server"
+import { DEN_HTTP_KEEP_ALIVE_TIMEOUT_MS, serveDenHttp } from "./http-server.js"
 import app from "./app.js"
+import { startSlackAssistantWorker } from "./slack-assistant/worker.js"
+import { startSlackDesktopHandoffWorker } from "./slack-assistant/desktop-handoff.js"
 import { env } from "./env.js"
 import { appLogger } from "./observability/logger.js"
 import { shutdownObservability } from "./observability/runtime.js"
 import { startScimMaintenanceLoop } from "./scim-maintenance.js"
+import { startLifecycleEmailLoop } from "./lifecycle-emails/index.js"
 import { startCloudIdleStopLoop } from "./workers/cloud-lifecycle.js"
 import { startWorkerProvisioningReconcileLoop } from "./workers/reconciler.js"
 import { startGithubSyncWorker } from "./workers/github-sync.js"
-import { startTelegramUpdateDispatcher } from "./capability-sources/telegram-dispatcher.js"
 import { externalMcpClientRuntimeName } from "./capability-sources/external-mcp-client-runtime.js"
 import { startAutomationSchedulerLoop } from "./automations/scheduler-loop.js"
+import { startModelsAnalyticsExportLoop } from "./models-analytics-export.js"
 
+const stopSlackAssistantWorker = startSlackAssistantWorker()
+const stopSlackDesktopHandoffWorker = startSlackDesktopHandoffWorker()
 const stopScimMaintenanceLoop = startScimMaintenanceLoop()
+const stopLifecycleEmailLoop = startLifecycleEmailLoop()
 const stopCloudIdleStopLoop = startCloudIdleStopLoop()
 const stopWorkerProvisioningReconcileLoop = startWorkerProvisioningReconcileLoop()
 const stopGithubSyncWorker = startGithubSyncWorker()
-const stopTelegramUpdateDispatcher = startTelegramUpdateDispatcher()
-const automationScheduler = startAutomationSchedulerLoop()
+const stopModelsAnalyticsExportLoop = startModelsAnalyticsExportLoop()
+const automationScheduler = startAutomationSchedulerLoop({ enabled: env.automations.runtimeEnabled })
 
 appLogger.info("external mcp implementation selected", { component: "server", runtime: externalMcpClientRuntimeName })
 
@@ -24,8 +30,8 @@ appLogger.info("external mcp implementation selected", { component: "server", ru
 // dev outbox) and must not be reachable from the LAN; production/default
 // behavior (all interfaces) is unchanged when DEN_BIND_HOST is unset.
 const bindHost = process.env.DEN_BIND_HOST?.trim()
-const server = serve({ fetch: app.fetch, port: env.port, ...(bindHost ? { hostname: bindHost } : {}) }, (info) => {
-  appLogger.info("server listening", { component: "server", port: info.port })
+const server = serveDenHttp({ fetch: app.fetch, port: env.port, ...(bindHost ? { hostname: bindHost } : {}) }, (info) => {
+  appLogger.info("server listening", { component: "server", port: info.port, keep_alive_timeout_ms: DEN_HTTP_KEEP_ALIVE_TIMEOUT_MS })
 })
 
 let shuttingDown = false
@@ -74,12 +80,15 @@ async function closeServer() {
 }
 
 async function stopBackgroundLoops() {
+  stopModelsAnalyticsExportLoop()
   const results = await Promise.allSettled([
     stopScimMaintenanceLoop(),
+    stopLifecycleEmailLoop(),
+    stopSlackAssistantWorker(),
+    stopSlackDesktopHandoffWorker(),
     stopCloudIdleStopLoop(),
     stopWorkerProvisioningReconcileLoop(),
     stopGithubSyncWorker(),
-    stopTelegramUpdateDispatcher(),
     automationScheduler.stop(),
   ])
 

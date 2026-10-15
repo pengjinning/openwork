@@ -9,7 +9,32 @@
  */
 import type { Session } from "@opencode-ai/sdk/v2/client";
 import type { Client, ModelRef } from "../types";
+import { isOpencodeV2Client } from "./opencode-v2-adapter";
 import { unwrap } from "./opencode";
+
+export type AbortSessionLogContext = {
+  source: string;
+  initiator: "user" | "system" | "app";
+  reason?: string;
+};
+
+function logAbortSession(
+  phase: "start" | "done" | "error",
+  sessionID: string,
+  directory: string | undefined,
+  context: AbortSessionLogContext | undefined,
+  extra?: { aborted?: boolean; error?: string },
+) {
+  console.info("[opencode-session] abort", {
+    phase,
+    source: context?.source ?? "unknown",
+    initiator: context?.initiator ?? "app",
+    reason: context?.reason ?? null,
+    sessionID,
+    directoryScoped: Boolean(directory?.trim()),
+    ...(extra ?? {}),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Session helpers
@@ -30,8 +55,19 @@ export async function abortSession(
   client: Client,
   sessionID: string,
   directory?: string,
+  logContext?: AbortSessionLogContext,
 ): Promise<boolean> {
-  return unwrap(await client.session.abort({ sessionID, directory })) === true;
+  logAbortSession("start", sessionID, directory, logContext);
+  try {
+    const aborted = unwrap(await client.session.abort({ sessionID, directory })) === true;
+    logAbortSession("done", sessionID, directory, logContext, { aborted });
+    return aborted;
+  } catch (error) {
+    logAbortSession("error", sessionID, directory, logContext, {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    throw error;
+  }
 }
 
 /**
@@ -43,9 +79,10 @@ export async function abortSessionSafe(
   client: Client,
   sessionID: string,
   directory?: string,
+  logContext?: AbortSessionLogContext,
 ): Promise<boolean> {
   try {
-    return await abortSession(client, sessionID, directory);
+    return await abortSession(client, sessionID, directory, logContext);
   } catch {
     // The session may already be idle or the server unreachable; callers
     // treat `false` as "nothing was aborted".
@@ -98,53 +135,55 @@ export async function setSessionArchived(
   sessionID: string,
   archived: boolean,
   directory?: string,
+  options?: { signal?: AbortSignal },
 ): Promise<void> {
   unwrap(
     await client.session.update({
       sessionID,
       directory,
       time: { archived: archived ? Date.now() : 0 },
-    }),
+    }, options),
   );
 }
 
 /**
- * Compact/summarize a long session to reduce context size.
- * Uses `session.summarize` when available and falls back to `/compact` command.
+ * Set the exact model bound to an existing session without sending a prompt.
+ *
+ * OpenCode v2 persists this through the canonical `/api/session/:id/model`
+ * endpoint, so future sends and reopened sessions use the replacement binding.
+ * Older clients have no equivalent standalone mutation and fail closed.
  */
-export async function compactSession(
+export async function setSessionModel(
   client: Client,
   sessionID: string,
   model: ModelRef,
-  options?: { directory?: string },
+  variant?: string | null,
+  options?: { signal?: AbortSignal },
 ): Promise<void> {
-  const session = client.session as { summarize?: (input: {
-    sessionID: string;
-    directory?: string;
-    providerID: string;
-    modelID: string;
-  }) => Promise<unknown> };
-
-  if (typeof session.summarize === "function") {
-    const result = await session.summarize({
-      sessionID,
-      directory: options?.directory,
-      providerID: model.providerID,
-      modelID: model.modelID,
-    });
-    assertNoClientError(result);
-    return;
+  if (!isOpencodeV2Client(client)) {
+    throw new Error("Session model reassignment requires the OpenCode v2 session API.");
   }
-
-  const modelString = `${model.providerID}/${model.modelID}`;
-  const result = await client.session.command({
+  const response = await client.session.setModel({
     sessionID,
-    command: "compact",
-    arguments: "",
-    model: modelString,
-    directory: options?.directory,
-  });
-  assertNoClientError(result);
+    model: { providerID: model.providerID, modelID: model.modelID },
+    ...(variant === undefined ? {} : { variant }),
+  }, options);
+  if (!response.request.url.endsWith(`/api/session/${encodeURIComponent(sessionID)}/model`)) {
+    throw new Error("Session model reassignment requires a direct v2 session model endpoint.");
+  }
+  if (!response.response.ok) {
+    let message = `Failed to update session model (${response.response.status}).`;
+    const payload = response.error;
+    if (payload && typeof payload === "object") {
+      const candidate = "message" in payload && typeof payload.message === "string"
+        ? payload.message
+        : "error" in payload && typeof payload.error === "object" && payload.error && "message" in payload.error && typeof payload.error.message === "string"
+          ? payload.error.message
+          : null;
+      if (candidate) message = candidate;
+    }
+    throw new Error(message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,9 +198,9 @@ export async function shellInSession(
   client: Client,
   sessionID: string,
   command: string,
-  options?: { model?: { providerID: string; modelID: string }; agent?: string; variant?: string },
+  options?: { model?: { providerID: string; modelID: string }; agent?: string; variant?: string; messageID?: string },
 ): Promise<void> {
-  const result = await client.session.shell({ sessionID, command });
+  const result = await client.session.shell({ sessionID, command, messageID: options?.messageID });
   assertNoClientError(result);
 }
 
@@ -174,6 +213,11 @@ export type CommandListItem = {
   name: string;
   description?: string;
   source?: "command" | "mcp" | "skill";
+  template?: string;
+  hints?: string[];
+  agent?: string;
+  model?: string;
+  subtask?: boolean;
 };
 
 /**
@@ -192,6 +236,13 @@ export async function listCommands(
       name: String(cmd.name ?? ""),
       description: cmd.description ? String(cmd.description) : undefined,
       source: cmd.source as CommandListItem["source"],
+      template: typeof cmd.template === "string" ? cmd.template : undefined,
+      hints: Array.isArray(cmd.hints)
+        ? cmd.hints.filter((hint): hint is string => typeof hint === "string")
+        : undefined,
+      agent: typeof cmd.agent === "string" ? cmd.agent : undefined,
+      model: typeof cmd.model === "string" ? cmd.model : undefined,
+      subtask: cmd.subtask === true,
     }));
   } catch {
     return [];

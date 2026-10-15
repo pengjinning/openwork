@@ -31,6 +31,12 @@ export type NativeOAuthProviderConfig = {
   tenantIdExtraKey?: string
   /** Higher provider scopes that satisfy a narrower required scope. */
   scopeImplications?: Record<string, string[]>
+  /**
+   * Requested scopes the provider may leave out of the token response `scope`
+   * even when granted. They are still requested, but never decide whether a
+   * member must reconnect.
+   */
+  unreportedScopes?: string[]
 }
 
 export const NATIVE_OAUTH_PROVIDERS: Record<string, NativeOAuthProviderConfig> = {
@@ -51,7 +57,12 @@ export const NATIVE_OAUTH_PROVIDERS: Record<string, NativeOAuthProviderConfig> =
       calendarRead: ["https://www.googleapis.com/auth/calendar.readonly"],
       calendarWrite: ["https://www.googleapis.com/auth/calendar.events"],
       gmailDraft: ["https://www.googleapis.com/auth/gmail.compose"],
+      gmailSend: ["https://www.googleapis.com/auth/gmail.compose"],
       gmailRead: ["https://www.googleapis.com/auth/gmail.readonly"],
+      gmailManage: ["https://www.googleapis.com/auth/gmail.modify"],
+      gmailLabels: ["https://www.googleapis.com/auth/gmail.labels"],
+      sheetsRead: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+      sheetsWrite: ["https://www.googleapis.com/auth/spreadsheets"],
       driveFile: ["https://www.googleapis.com/auth/drive.file"],
       driveRead: ["https://www.googleapis.com/auth/drive.readonly"],
       driveFull: ["https://www.googleapis.com/auth/drive"],
@@ -60,6 +71,11 @@ export const NATIVE_OAUTH_PROVIDERS: Record<string, NativeOAuthProviderConfig> =
         "https://www.googleapis.com/auth/chat.messages.readonly",
         "https://www.googleapis.com/auth/chat.messages.create",
       ],
+    },
+    scopeImplications: {
+      "https://www.googleapis.com/auth/gmail.modify": ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose", "https://www.googleapis.com/auth/gmail.labels"],
+      "https://www.googleapis.com/auth/spreadsheets": ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+      "https://www.googleapis.com/auth/drive": ["https://www.googleapis.com/auth/drive.readonly", "https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/spreadsheets.readonly"],
     },
     usesPkce: true,
     extraAuthorizeParams: {
@@ -79,6 +95,8 @@ export const NATIVE_OAUTH_PROVIDERS: Record<string, NativeOAuthProviderConfig> =
     optionalFeatures: {
       mailRead: ["Mail.Read"],
       mailDraft: ["Mail.ReadWrite"],
+      mailSend: ["Mail.Send"],
+      mailManage: ["Mail.ReadWrite"],
       calendarRead: ["Calendars.Read"],
       calendarWrite: ["Calendars.ReadWrite"],
       filesRead: ["Files.Read"],
@@ -98,6 +116,9 @@ export const NATIVE_OAUTH_PROVIDERS: Record<string, NativeOAuthProviderConfig> =
     },
     usesPkce: true,
     tenantIdExtraKey: "tenantId",
+    // Entra never lists offline_access in the token response (it answers with a
+    // refresh token instead) and may omit the OpenID Connect scopes.
+    unreportedScopes: ["openid", "profile", "email", "offline_access"],
   },
 }
 

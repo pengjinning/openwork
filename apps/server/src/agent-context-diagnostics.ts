@@ -41,6 +41,10 @@ import {
 } from "./connect-state.js";
 import { readJsoncFile } from "./jsonc.js";
 import {
+  inspectLocalManagedMcpVault,
+  type LocalManagedMcpVaultInspection,
+} from "./local-managed-mcp.js";
+import {
   inspectMcpLayersFromRuntimeSnapshot,
   type McpConfigCollision,
   type McpInventoryInspection,
@@ -48,7 +52,9 @@ import {
 import { resolveWorkspaceOpencodeConnection } from "./opencode-connection.js";
 import { buildOpenworkRuntimeConfigObjectFromSnapshot } from "./openwork-runtime-config.js";
 import {
+  ENGINE_GLOBAL_RUNTIME_CONFIG_ID,
   inspectRuntimeOpencodeConfigState,
+  mergeRuntimeOpencodeConfigLayers,
   runtimeMcpMap,
   type RuntimeOpencodeConfig,
   type RuntimeOpencodeConfigInspection,
@@ -258,7 +264,7 @@ export function expectedConnectBranch(snapshot: ConnectSnapshot): AgentContextDi
   const health = snapshot.cloudHealth;
   if (health?.usable === true && health.usableByCurrentModel !== false) return "cloud-active";
   if (health) return "cloud-disconnected";
-  if (!snapshot.connectCatalogEnabled || snapshot.googleWorkspace.legacyConfigured) return "extensions-only";
+  if (!snapshot.connectCatalogEnabled) return "extensions-only";
   return "cloud-disconnected";
 }
 
@@ -332,7 +338,7 @@ function promptEvidence(configuredAgent: Record<string, unknown> | null) {
     markers: {
       searchCapabilities: prompt.includes("search_capabilities"),
       executeCapability: prompt.includes("execute_capability"),
-      memoryBank: prompt.includes("Memory Bank"),
+      artifacts: prompt.includes("## OpenWork Artifacts"),
     },
   };
 }
@@ -1177,6 +1183,7 @@ function runtimeHealthCheck(
   workspace: WorkspaceInfo,
   engineConfigured: boolean,
   inspection: RuntimeOpencodeConfigInspection,
+  managedVault: LocalManagedMcpVaultInspection | null,
   durationMs: number,
 ): AgentContextDiagnosticCheck {
   const corrupt = inspection.status === "unreadable"
@@ -1184,14 +1191,11 @@ function runtimeHealthCheck(
   const absent = inspection.status === "database-missing"
     || inspection.status === "row-missing"
     || inspection.status === "table-missing";
-  const remote = inspection.status === "remote-workspace";
-  const status = corrupt || !engineConfigured ? "failed" : absent || remote ? "warning" : "passed";
+  const status = corrupt || !engineConfigured ? "failed" : absent ? "warning" : "passed";
   const code = corrupt
     ? "runtime_config_unreadable"
     : !engineConfigured
       ? "workspace_engine_unconfigured"
-      : remote
-        ? "remote_workspace_runtime_not_inspected"
       : absent
         ? "runtime_config_not_initialized"
         : "workspace_runtime_configured";
@@ -1201,8 +1205,6 @@ function runtimeHealthCheck(
       ? "The selected workspace does not have an OpenCode runtime endpoint configured."
       : absent
         ? "The runtime configuration database or selected workspace row has not been initialized."
-        : remote
-          ? "A local runtime row was not inspected for the remote workspace shell."
         : "The selected workspace runtime configuration is available and the engine endpoint is configured.";
   return diagnosticCheck({
     id: "workspace-runtime",
@@ -1215,13 +1217,14 @@ function runtimeHealthCheck(
       ? "No action is required."
       : corrupt
         ? "Repair the OpenWork runtime state before relying on injected configuration."
-        : remote
-          ? "Run diagnostics on the OpenWork server that owns the workspace."
-          : "Start or configure the selected workspace runtime, then rerun diagnostics.",
+        : "Start or configure the selected workspace runtime, then rerun diagnostics.",
     details: {
       workspaceType: workspace.workspaceType,
-      remoteType: workspace.remoteType ?? null,
+      remoteType: null,
       runtimeInspectionStatus: inspection.status,
+      managedMcpVaultStatus: managedVault ? managedVault.status : "not-inspected",
+      managedMcpVaultRecoveredAt: managedVault?.recovery?.at ?? null,
+      managedMcpVaultQuarantinedTo: managedVault?.recovery?.quarantinedTo ?? null,
     },
     durationMs,
   });
@@ -1271,15 +1274,26 @@ export async function runAgentContextDiagnostics(input: {
 
   input.dependencies?.signal?.throwIfAborted();
   const runtimeStarted = now();
-  const runtimeInspection: RuntimeOpencodeConfigInspection = input.workspace.workspaceType === "remote"
-    ? { status: "remote-workspace", config: {} }
-    : await inspectRuntimeOpencodeConfigState(input.config, input.workspace.id, {
-      signal: input.dependencies?.signal,
-    });
+  const runtimeInspection: RuntimeOpencodeConfigInspection = await inspectRuntimeOpencodeConfigState(
+    input.config,
+    input.workspace.id,
+    { signal: input.dependencies?.signal },
+  );
+  // Passive plaintext read of the managed MCP credential vault: surfaces
+  // secure-storage recovery evidence without decrypting and never throws.
+  const managedVaultInspection = await inspectLocalManagedMcpVault(input.config);
+  const globalRuntimeInspection = await inspectRuntimeOpencodeConfigState(
+    input.config,
+    ENGINE_GLOBAL_RUNTIME_CONFIG_ID,
+    { signal: input.dependencies?.signal },
+  );
+  const runtime = mergeRuntimeOpencodeConfigLayers(globalRuntimeInspection.config, runtimeInspection.config);
   input.dependencies?.signal?.throwIfAborted();
   const runtimeDuration = elapsed(runtimeStarted, now);
-  const runtime = runtimeInspection.config;
-  const expectedRuntimeConfig = buildOpenworkRuntimeConfigObjectFromSnapshot(runtime);
+  // The injected engine config file is rendered from the ENGINE_GLOBAL row
+  // only; the merged per-workspace runtime row informs MCP inventory below
+  // but is not part of the injected file.
+  const expectedRuntimeConfig = buildOpenworkRuntimeConfigObjectFromSnapshot(globalRuntimeInspection.config);
   const expectedAgents = isRecord(expectedRuntimeConfig.agent) ? expectedRuntimeConfig.agent : {};
   const expectedAgent = isRecord(expectedAgents.openwork) ? expectedAgents.openwork : null;
   const effectiveOpenworkAgent = effectiveEngine?.agents.find((agent) => agent.name === "openwork") ?? null;
@@ -1301,7 +1315,7 @@ export async function runAgentContextDiagnostics(input: {
   const expectedPrompt = promptEvidence(expectedAgent);
   const promptMarkersPresent = prompt.markers.searchCapabilities
     && prompt.markers.executeCapability
-    && prompt.markers.memoryBank;
+    && prompt.markers.artifacts;
   const canonicalPromptDigestMatch = prompt.sha256 !== null
     && expectedPrompt.sha256 !== null
     && prompt.sha256 === expectedPrompt.sha256;
@@ -1339,7 +1353,6 @@ export async function runAgentContextDiagnostics(input: {
   let connectSnapshotAvailable = true;
   let connectStateStatus: ConnectStateInspectionStatus = "unreadable";
   try {
-    if (input.workspace.workspaceType === "remote") throw new Error("passive remote inspection");
     const inspection = await inspectConnectSnapshot(input.config, { signal: input.dependencies?.signal });
     connectStateStatus = inspection.status;
     connectSnapshotAvailable = inspection.status === "available" || inspection.status === "missing";
@@ -1359,7 +1372,6 @@ export async function runAgentContextDiagnostics(input: {
         directory: null,
         reason: "Passive Connect inspection was unavailable",
       },
-      googleWorkspace: { legacyConfigured: false },
     };
   }
   const selectedCloudMcpPresent = Object.hasOwn(runtimeMcpMap(runtime), OPENWORK_CLOUD_MCP_NAME);
@@ -1548,7 +1560,7 @@ export async function runAgentContextDiagnostics(input: {
         organizationConnectionsTruncated: request.organizationConnectionsProbe.truncated,
       },
     }),
-    runtimeHealthCheck(input.workspace, engineConfigured, runtimeInspection, runtimeDuration),
+    runtimeHealthCheck(input.workspace, engineConfigured, runtimeInspection, managedVaultInspection, runtimeDuration),
     diagnosticCheck({
       id: "connect-steering-scope",
       status: !connectSnapshotAvailable || crossWorkspaceSteeringDrift ? "warning" : "passed",
@@ -1573,7 +1585,6 @@ export async function runAgentContextDiagnostics(input: {
         expectedBranch: branch,
         connectStateStatus,
         connectEnabled: connectSnapshot.connectEnabled,
-        legacyGoogleWorkspaceConfigured: connectSnapshot.googleWorkspace.legacyConfigured,
         globalCloudMcpPresent: connectSnapshot.cloudMcpPresent,
         selectedWorkspaceCloudMcpPresent: selectedCloudMcpPresent,
       },
@@ -1930,7 +1941,7 @@ export async function runAgentContextDiagnostics(input: {
       id: safeText(input.workspace.id, 160, "unknown-workspace"),
       name: safeText(input.workspace.name, 240, "Unnamed workspace"),
       type: input.workspace.workspaceType,
-      remoteType: input.workspace.remoteType ?? null,
+      remoteType: null,
       engineConfigured,
     },
     checks,
@@ -1966,7 +1977,6 @@ export async function runAgentContextDiagnostics(input: {
     connect: {
       stateStatus: connectSnapshot.status,
       connectEnabled: connectSnapshot.connectEnabled,
-      legacyGoogleWorkspaceConfigured: connectSnapshot.googleWorkspace.legacyConfigured,
       expectedBranch: branch,
       globalCloudMcpPresent: connectSnapshot.cloudMcpPresent,
       selectedWorkspaceCloudMcpPresent: selectedCloudMcpPresent,

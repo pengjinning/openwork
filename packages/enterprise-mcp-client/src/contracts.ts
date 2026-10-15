@@ -1,7 +1,21 @@
-import type { OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js"
-import type { OAuthClientInformationMixed, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js"
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import type { Implementation, ServerCapabilities, Tool } from "@modelcontextprotocol/sdk/types.js"
+import type {
+  Client,
+  Implementation,
+  OAuthDiscoveryState,
+  ServerCapabilities,
+  StoredOAuthClientInformation,
+  StoredOAuthTokens,
+  Tool,
+} from "@modelcontextprotocol/client"
+
+export type { StoredOAuthClientInformation, StoredOAuthTokens } from "@modelcontextprotocol/client"
+
+/**
+ * Most OAuth scopes one connection may request. Without a required scope, MCP
+ * clients request every scope the resource advertises, and some servers list
+ * well over a hundred (PostHog advertises 155).
+ */
+export const ENTERPRISE_MCP_REQUESTED_SCOPES_LIMIT = 512
 
 /** Epoch milliseconds. The package never reads a database or environment clock. */
 export type EnterpriseMcpEpochMs = number
@@ -29,7 +43,7 @@ export type EnterpriseMcpPersistenceContext = {
 }
 
 export type EnterpriseMcpOAuthClientRegistration = {
-  clientInformation: OAuthClientInformationMixed
+  clientInformation: StoredOAuthClientInformation
   /** Opaque adapter-owned compare-and-swap revision. */
   revision: string
   /** Absolute client/client-secret expiration, when the provider declares one. */
@@ -45,7 +59,9 @@ export interface EnterpriseMcpOAuthClientRegistrationPort {
    */
   save(input: {
     context: EnterpriseMcpPersistenceContext
-    clientInformation: OAuthClientInformationMixed
+    clientInformation: StoredOAuthClientInformation
+    /** The redirect URI used for this client registration attempt. */
+    redirectUri: string
     expiresAt?: EnterpriseMcpEpochMs
     source: "client-metadata" | "dynamic"
   }): Promise<EnterpriseMcpOAuthClientRegistration>
@@ -68,7 +84,7 @@ export interface EnterpriseMcpOAuthDiscoveryPort {
 }
 
 export type EnterpriseMcpOAuthCredential = {
-  tokens: OAuthTokens
+  tokens: StoredOAuthTokens
   /** Absolute access-token expiration, computed when tokens are committed. */
   expiresAt?: EnterpriseMcpEpochMs
   /** Opaque adapter-owned compare-and-swap revision. */
@@ -117,7 +133,7 @@ export interface EnterpriseMcpOAuthCredentialPort {
    */
   save(input: {
     context: EnterpriseMcpPersistenceContext
-    tokens: OAuthTokens
+    tokens: StoredOAuthTokens
     expiresAt?: EnterpriseMcpEpochMs
     source: "authorization-code" | "refresh"
     authorization?: EnterpriseMcpOAuthAuthorizationHandle
@@ -129,7 +145,29 @@ export interface EnterpriseMcpOAuthCredentialPort {
     context: EnterpriseMcpPersistenceContext
     reason: "expired" | "provider-rejected" | "post-authorization-validation-failed"
   }): Promise<void>
+  /**
+   * Optional. Runs one refresh-token grant at a time per credential, across
+   * every process sharing the store. Providers that rotate refresh tokens keep
+   * only one of several concurrent refreshes valid, so parallel grants can
+   * leave the saved credential unusable. The adapter holds the credential
+   * exclusively, then:
+   * - returns `superseded` with the current credential (if any), without
+   *   calling `refresh`, when the stored refresh token is no longer
+   *   `refreshToken`;
+   * - otherwise calls `refresh` and, when it returns tokens, commits them as a
+   *   refresh before releasing the credential (`refreshed`), or commits
+   *   nothing (`not-saved`).
+   */
+  refreshExclusively?(input: {
+    context: EnterpriseMcpPersistenceContext
+    refreshToken: string
+    refresh: () => Promise<{ tokens: StoredOAuthTokens; expiresAt?: EnterpriseMcpEpochMs } | undefined>
+  }): Promise<EnterpriseMcpOAuthRefreshOutcome>
 }
+
+export type EnterpriseMcpOAuthRefreshOutcome =
+  | { status: "refreshed" | "not-saved" }
+  | { status: "superseded"; credential?: EnterpriseMcpOAuthCredential }
 
 /** Application-owned ports. No database, tenant, or deployment shape leaks in. */
 export type EnterpriseMcpOAuthPersistence = {
@@ -153,6 +191,7 @@ export type EnterpriseMcpRequestPhase =
   | "oauth-client-registration"
   | "oauth-token-exchange"
   | "oauth-token-refresh"
+  | "mcp-discovery"
   | "mcp-initialize"
   | "mcp-tool-discovery"
   | "mcp-tool-execution"
@@ -182,7 +221,8 @@ export type EnterpriseMcpDiagnosticEvent =
     durationMs?: number
     httpStatus?: number
     responseBodyExcerpt?: string
-    protocolVersionFallback?: string
+    protocolEra?: "modern" | "legacy"
+    protocolVersion?: string
   }
   | {
     kind: "credential-invalidation"
@@ -197,7 +237,7 @@ export type EnterpriseMcpDiagnosticSink = (event: EnterpriseMcpDiagnosticEvent) 
 
 export type EnterpriseMcpAuthorization =
   | { type: "none" }
-  | { type: "api-key"; token: string }
+  | { type: "api-key"; token: string; scheme?: "bearer" | "token" }
   | {
     type: "oauth"
     persistence: EnterpriseMcpOAuthPersistence
@@ -225,6 +265,8 @@ export type EnterpriseMcpCompleteAuthorizationInput = {
   connection: EnterpriseMcpConnection
   redirectUri: string
   code: string
+  /** The decoded iss parameter from the authorization response, when present. */
+  responseIssuer?: string
   /** The exact signed state returned by the provider callback. */
   authorizationId: string
 }
@@ -247,6 +289,14 @@ export type EnterpriseMcpCallToolInput = {
   arguments: Record<string, unknown>
 }
 
+export type EnterpriseMcpCallListedToolInput = EnterpriseMcpCallToolInput & {
+  /**
+   * Runs on the provider's current tool list, in the same session as the call.
+   * Throwing refuses the call before anything is sent to the tool.
+   */
+  beforeCall: (tools: EnterpriseMcpTool[]) => void | Promise<void>
+}
+
 export type EnterpriseMcpListResourcesInput = {
   connection: EnterpriseMcpConnection
   redirectUri: string
@@ -264,6 +314,10 @@ export type EnterpriseMcpListResourceTemplatesInput = {
 }
 
 export type EnterpriseMcpToolResult = Awaited<ReturnType<Client["callTool"]>>
+export type EnterpriseMcpTool = Omit<Tool, "inputSchema" | "outputSchema"> & {
+  inputSchema: Record<string, unknown>
+  outputSchema?: Record<string, unknown>
+}
 export type EnterpriseMcpResourceList = Awaited<ReturnType<Client["listResources"]>>["resources"]
 export type EnterpriseMcpResourceTemplateList = Awaited<ReturnType<Client["listResourceTemplates"]>>["resourceTemplates"]
 export type EnterpriseMcpResourceResult = Awaited<ReturnType<Client["readResource"]>>
@@ -302,7 +356,9 @@ export type EnterpriseMcpConnectionRequirements = {
   status: "ready" | "manual_action_required" | "unsupported" | "unreachable"
   server: {
     url: string
+    protocolEra?: "modern" | "legacy"
     protocolVersion?: string
+    /** Protocol-negotiation status; the field name is retained for API compatibility. */
     initialize: "succeeded" | "authentication_required" | "failed"
   }
   authentication: {
@@ -359,9 +415,11 @@ export interface EnterpriseMcpClient {
   connect(input: EnterpriseMcpConnectInput): Promise<EnterpriseMcpConnectResult>
   completeAuthorization(input: EnterpriseMcpCompleteAuthorizationInput): Promise<void>
   abandonAuthorization(input: EnterpriseMcpAbandonAuthorizationInput): Promise<void>
-  listTools(input: EnterpriseMcpListToolsInput): Promise<Tool[]>
+  listTools(input: EnterpriseMcpListToolsInput): Promise<EnterpriseMcpTool[]>
   callTool(input: EnterpriseMcpCallToolInput): Promise<EnterpriseMcpToolResult>
   callToolRaw(input: EnterpriseMcpCallToolInput): Promise<EnterpriseMcpToolResult>
+  /** Lists tools, then calls one, in a single provider session. */
+  callListedTool(input: EnterpriseMcpCallListedToolInput): Promise<EnterpriseMcpToolResult>
   listResources(input: EnterpriseMcpListResourcesInput): Promise<EnterpriseMcpResourceList>
   readResource(input: EnterpriseMcpReadResourceInput): Promise<EnterpriseMcpResourceResult>
   listResourceTemplates(input: EnterpriseMcpListResourceTemplatesInput): Promise<EnterpriseMcpResourceTemplateList>

@@ -2,6 +2,8 @@ import type { Context, Env, Hono, MiddlewareHandler } from "hono"
 import { HTTPException } from "hono/http-exception"
 import type { AppLogger } from "./logger.js"
 import { appLogger } from "./logger.js"
+import { countDbQueries } from "./db-query-count.js"
+import { withRequestReads } from "../request-reads.js"
 import { normalizedHonoRoute } from "./hono-route.js"
 import { attachRequestContext, getRuntimeState } from "./runtime.js"
 import { sanitizeExceptionForTelemetry, sanitizeText } from "./safe-fields.js"
@@ -43,6 +45,7 @@ export function createRequestAccessLogMiddleware(logger: AppLogger = appLogger.c
     }
 
     const startedAt = performance.now()
+    const queries = { count: 0 }
     let thrownError: unknown
     const requestId = c.get("requestId")
 
@@ -51,7 +54,8 @@ export function createRequestAccessLogMiddleware(logger: AppLogger = appLogger.c
     })
 
     try {
-      await next()
+      // Each request, including a nested app.fetch, gets its own shared reads.
+      await countDbQueries(queries, () => withRequestReads(next))
     } catch (error) {
       thrownError = error
       throw error
@@ -69,6 +73,7 @@ export function createRequestAccessLogMiddleware(logger: AppLogger = appLogger.c
         http_route: route,
         http_status_code: status,
         duration_ms: Math.round((performance.now() - startedAt) * 100) / 100,
+        db_queries: queries.count,
       })
     }
   }
@@ -98,12 +103,12 @@ export function createTelemetryErrorSanitizerMiddleware(): MiddlewareHandler {
   }
 }
 
-type ErrorResponseFactory<E extends Env> = (error: Error, c: Context<E>, requestId: string) => Response | undefined
+type ErrorResponseFactory<E extends Env> = (error: Error, c: Context<E>, requestId: string) => Response | undefined | Promise<Response | undefined>
 
 export function registerAppErrorHandler<E extends Env>(app: Hono<E>, responseForError?: ErrorResponseFactory<E>) {
   const logger = appLogger.child({ component: "http" })
 
-  app.onError((error, c) => {
+  app.onError(async (error, c) => {
     const safeError = sanitizeRequestError(error)
     const status = statusFromError(safeError)
     const requestId = c.get("requestId")
@@ -121,7 +126,7 @@ export function registerAppErrorHandler<E extends Env>(app: Hono<E>, responseFor
       logger.warn("request rejected", fields)
     }
 
-    const customResponse = responseForError?.(safeError, c, requestId)
+    const customResponse = await responseForError?.(safeError, c, requestId)
     if (customResponse) {
       return customResponse
     }

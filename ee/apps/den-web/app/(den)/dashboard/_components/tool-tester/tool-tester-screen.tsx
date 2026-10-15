@@ -20,9 +20,10 @@ import { DenNotice } from "../../../_components/ui/notice";
 import { DenSelect } from "../../../_components/ui/select";
 import { DenToggleRow } from "../../../_components/ui/toggle-row";
 import { DenRequestTimeoutError } from "../../../_lib/den-flow";
-import { getOrgAccessFlags, getYourConnectionsRoute } from "../../../_lib/den-org";
+import { getMcpConnectionsRoute, getOrgAccessFlags } from "../../../_lib/den-org";
 import { useOrgDashboard } from "../../_providers/org-dashboard-provider";
 import { marketplaceConnectionNeedsAdminSetup } from "../mcp-connection-setup";
+import { personalApiKeyStatus, personalApiKeyStatusLabel } from "../member-api-key";
 import {
   type ExternalMcpConnection,
   type ExternalMcpTool,
@@ -85,12 +86,12 @@ function policyAttribution(policy: ExternalMcpToolPolicyView): string {
 
 function testableConnection(
   connection: ExternalMcpConnection,
-  isAdmin: boolean,
+  canManageConnections: boolean,
   needsAdminSetup: boolean,
 ): boolean {
-  return isAdmin
+  return canManageConnections
     && !isNativeProviderConnectionId(connection.id, connection.nativeProviderKey)
-    && connection.connectedForMe
+    && (connection.credentialMode === "shared" ? connection.connected : connection.connectedForMe)
     && connection.needsReconnect !== true
     && !needsAdminSetup;
 }
@@ -104,17 +105,17 @@ export function ToolTesterScreen() {
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
     orgContext?.currentMember.isOwner ?? false,
-    orgContext?.roles,
+    orgContext?.currentMember.permissions,
   );
-  const connectionsQuery = useMcpConnections("usable");
+  const connectionsQuery = useMcpConnections("manageable");
   const presetsQuery = useMcpConnectionPresets();
   const testableConnections = useMemo(() => (
     (connectionsQuery.data ?? []).filter((connection) => testableConnection(
       connection,
-      access.isAdmin,
+      access.canManageConnections,
       marketplaceConnectionNeedsAdminSetup(connection, presetsQuery.data ?? []),
     ))
-  ), [access.isAdmin, connectionsQuery.data, presetsQuery.data]);
+  ), [access.canManageConnections, connectionsQuery.data, presetsQuery.data]);
   const [selectedConnectionId, setSelectedConnectionId] = useState(requestedConnectionId ?? "");
   const [selectedToolName, setSelectedToolName] = useState("");
   const [toolSearch, setToolSearch] = useState("");
@@ -131,6 +132,7 @@ export function ToolTesterScreen() {
   const [pendingLoad, setPendingLoad] = useState<StoredToolRun | null>(null);
 
   const selectedConnection = testableConnections.find((connection) => connection.id === selectedConnectionId) ?? null;
+  const selectedApiKeyStatus = selectedConnection ? personalApiKeyStatus(selectedConnection) : null;
   const catalog = useMcpConnectionTools(selectedConnectionId, Boolean(selectedConnection));
   const updatePolicy = useUpdateMcpConnectionToolPolicy(selectedConnectionId);
   const runTool = useRunMcpConnectionTool(selectedConnectionId);
@@ -403,7 +405,6 @@ export function ToolTesterScreen() {
     <DashboardPageTemplate
       icon={Wrench}
       title="Tool Tester"
-      colors={["#CFFAFE", "#155E75", "#0E7490", "#67E8F9"]}
       description="Run any tool your connections expose, inspect the request on the wire, and control which tools your organization can use. Runs execute with your credential and are never written to OpenWork logs."
     >
       {connectionsQuery.error ? (
@@ -417,7 +418,7 @@ export function ToolTesterScreen() {
       ) : testableConnections.length === 0 ? (
         <DenNotice
           tone="neutral"
-          message={<span>No connected, testable MCP connections are available. <Link className="font-medium text-gray-900 underline" href={getYourConnectionsRoute(orgSlug)}>Open Your Connections</Link> to connect one.</span>}
+          message={<span>No connected, testable MCP connections are available. <Link className="font-medium text-gray-900 underline" href={getMcpConnectionsRoute(orgSlug)}>Add or connect a connector first.</Link></span>}
         />
       ) : selectedConnection ? (
         <div className="space-y-5">
@@ -427,8 +428,10 @@ export function ToolTesterScreen() {
                 {testableConnections.map((connection) => <option key={connection.id} value={connection.id}>{connection.name}</option>)}
               </DenSelect>
             </div>
-            <DenBadge tone={selectedConnection.connectedForMe ? "success" : "neutral"}>
-              {selectedConnection.connectedForMe ? "Connected as you" : "Not connected"}
+            <DenBadge tone={selectedApiKeyStatus === "reconnect_required" ? "warning" : selectedApiKeyStatus === "saved_unverified" ? "neutral" : selectedConnection.connectedForMe ? "success" : "neutral"}>
+              {selectedApiKeyStatus
+                ? personalApiKeyStatusLabel(selectedApiKeyStatus)
+                : selectedConnection.connectedForMe ? "Connected as you" : "Not connected"}
             </DenBadge>
             <DenButton
               className="shrink-0 whitespace-nowrap sm:ml-auto"

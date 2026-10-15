@@ -7,6 +7,7 @@ import { isSingleOrgSignupDisabled, resolveVisibleAuthMode } from "../_lib/auth-
 import { isSamePathname } from "../_lib/client-route";
 import { getDesktopGrant } from "../_lib/desktop-handoff";
 import { getErrorMessage, getSocialCallbackUrl, requestJson, type AuthMode } from "../_lib/den-flow";
+import { signsInInPlace } from "../_lib/auth-resume";
 import { getMcpOAuthSelectOrganizationRoute } from "../_lib/mcp-oauth-route";
 import { useDesktopHandoffStatus } from "../_lib/use-desktop-handoff-status";
 import { useDenFlow } from "../_providers/den-flow-provider";
@@ -137,7 +138,7 @@ function DesktopHandoffCopyLink({
   );
 }
 
-function DesktopHandoffAction({
+export function DesktopHandoffAction({
   openworkUrl,
   grant,
   organizationName,
@@ -220,10 +221,14 @@ export function AuthPanel({
   emailFirstInvitationId,
   resolveEmailFirstOnPrefill = false,
   eyebrow = "Account",
+  hideIntro = false,
   bare = false,
   signUpContent,
   signInContent,
   verificationContent,
+  emailStepContent,
+  socialFirst = false,
+  socialProviders = ["google", "github"],
 }: {
   prefilledEmail?: string;
   prefillKey?: string;
@@ -236,6 +241,7 @@ export function AuthPanel({
   emailFirstInvitationId?: string;
   resolveEmailFirstOnPrefill?: boolean;
   eyebrow?: string;
+  hideIntro?: boolean;
   // When true the panel renders without its own `den-frame`/padding, so a parent
   // (the unified split auth card) can own the surface. Defaults to a self-framed
   // card for standalone callers (invite, workspace-claim).
@@ -243,6 +249,16 @@ export function AuthPanel({
   signUpContent?: Partial<PanelContent>;
   signInContent?: Partial<PanelContent>;
   verificationContent?: Partial<PanelContent>;
+  /** Title and helper for the email step of the email-first flow. */
+  emailStepContent?: Partial<PanelContent>;
+  /**
+   * One-page flows (agent sign-in, device and claim codes, connection links)
+   * lead with Google and GitHub above the email field, and show the helper
+   * copy under the form instead of an intro paragraph.
+   */
+  socialFirst?: boolean;
+  /** Which providers a social-first panel offers. */
+  socialProviders?: readonly ("google" | "github")[];
 }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -273,8 +289,10 @@ export function AuthPanel({
     signupPasswordFeedback,
     user,
     desktopAuthRequested,
+    setupPending,
     desktopRedirectUrl,
     desktopRedirectBusy,
+    retryDesktopAuthHandoff,
     showAuthFeedback,
     submitAuth,
     submitVerificationCode,
@@ -298,14 +316,14 @@ export function AuthPanel({
     if (emailFirstInvite) {
       params.set("invite", emailFirstInvite);
     }
-    return `/v1/auth/login-options?${params.toString()}`;
+    return `/api/auth/login-options?${params.toString()}`;
   }
 
   useEffect(() => {
-    if (isSingleOrgPrivateSignup && authMode === "sign-up") {
+    if (isSingleOrgPrivateSignup && !emailFirstInvite && authMode === "sign-up") {
       setAuthMode("sign-in");
     }
-  }, [authMode, isSingleOrgPrivateSignup, setAuthMode]);
+  }, [authMode, emailFirstInvite, isSingleOrgPrivateSignup, setAuthMode]);
 
   useEffect(() => {
     if (!isSingleOrgSsoMode || pathname === "/" || pathname === "/join-org") {
@@ -319,7 +337,7 @@ export function AuthPanel({
     title: isSingleOrgMode ? "Create your account." : "Get started.",
     copy: isSingleOrgMode
       ? `Join ${singleOrgName}. The organization is managed by this deployment.`
-      : "Free to try. Team plans from $50/mo.",
+      : "Free to try. Team plans from $10 per seat.",
     submitLabel: "Create account",
     ...signUpContent,
   };
@@ -361,6 +379,7 @@ export function AuthPanel({
           title: "Start using OpenWork",
           copy: "Enter your email and we'll send you to the right sign-in step.",
           submitLabel: "Next",
+          ...emailStepContent,
         }
       : emailFirstStep === "sso"
       ? {
@@ -390,6 +409,7 @@ export function AuthPanel({
           title: "Create your account.",
           copy: "Set up your OpenWork Cloud account.",
           submitLabel: "Sign up",
+          ...signUpContent,
         };
 
   const desktopGrant = getDesktopGrant(desktopRedirectUrl);
@@ -407,6 +427,7 @@ export function AuthPanel({
       ? resolvedSignInContent
       : resolvedSignUpContent;
   const showLockedEmailSummary = Boolean(prefilledEmail && lockEmail && hideEmailField && !hideLockedEmailSummary);
+  const titleClass = bare ? "text-[24px] font-semibold leading-tight tracking-[-0.03em] text-[var(--dls-text-primary)]" : "den-title-lg";
   const shellClass = (gap: string, padding: string) =>
     bare ? `grid ${gap}` : `den-frame grid ${gap} ${padding}`;
   // The segmented tabs are the primary sign-in/sign-up switch. Hide them for the
@@ -570,6 +591,10 @@ export function AuthPanel({
       router.replace(oauthRoute);
       return;
     }
+    // In-place pages re-render with the new session and continue their own step.
+    if (next && signsInInPlace(pathname)) {
+      return;
+    }
     if (next === "dashboard" || next === "join-org") {
       const target = await resolveUserLandingRoute();
       if (target && !isSamePathname(pathname, target)) {
@@ -617,7 +642,7 @@ export function AuthPanel({
   // Gate on the session user (not authInfo feedback). Otherwise a hydrated
   // desktop session still renders the email-first form underneath the Open
   // OpenWork button.
-  const isSignedInWithDesktopHandoff = Boolean(desktopAuthRequested && user && !authError);
+  const isSignedInWithDesktopHandoff = Boolean(desktopAuthRequested && user && !setupPending);
   const signedInEmail = user?.email?.trim() || "";
   const emailFirstPanelActive = emailFirstFlow && !isSingleOrgSsoMode && !verificationRequired && !isPasswordResetRequest;
   const emailFirstFormBusy = loginOptionBusy || authBusy || desktopRedirectBusy;
@@ -629,7 +654,7 @@ export function AuthPanel({
         <div className="grid gap-3">
           <p className="den-eyebrow">{eyebrow}</p>
           <div className="grid gap-2">
-            <h2 className="den-title-lg">You&apos;re signed in.</h2>
+            <h2 className={titleClass}>You&apos;re signed in.</h2>
             <p className="den-copy">
               {signedInEmail ? (
                 <>
@@ -649,9 +674,14 @@ export function AuthPanel({
             organizationName={isSingleOrgMode ? singleOrgName : null}
             showCopyLinkByDefault
           />
+        ) : authError ? (
+          <div className="grid gap-3">
+            <p role="alert" className="text-sm text-rose-600">{authError}</p>
+            <button type="button" className="den-button-primary w-full" disabled={desktopRedirectBusy} onClick={retryDesktopAuthHandoff}>Retry opening OpenWork</button>
+          </div>
         ) : (
           <div className="den-frame-inset rounded-[1.5rem] px-4 py-3 text-center text-sm text-[var(--dls-text-secondary)]" aria-live="polite">
-            Preparing your OpenWork sign-in link...
+            Checking your workspace...
           </div>
         )}
 
@@ -674,13 +704,35 @@ export function AuthPanel({
   if (emailFirstPanelActive) {
     return (
       <div className={shellClass("gap-4 sm:gap-5", "p-5 sm:p-6 md:p-7")}>
-        <div className="grid gap-3">
-          <p className="den-eyebrow">{eyebrow}</p>
-          <div className="grid gap-2">
-            <h2 className="den-title-lg">{activeContent.title}</h2>
-            <p className="den-copy">{activeContent.copy}</p>
+        {!hideIntro ? (
+          <div className="grid gap-3">
+            <p className="den-eyebrow">{eyebrow}</p>
+            <div className="grid gap-2">
+              <h2 className={titleClass}>{activeContent.title}</h2>
+              {socialFirst && emailFirstStep === "email" ? null : <p className="den-copy">{activeContent.copy}</p>}
+            </div>
           </div>
-        </div>
+        ) : null}
+
+        {socialFirst && showSocialAuth && !waitingForPrefilledLoginOption && emailFirstStep === "email" ? (
+          <div className="grid gap-2.5">
+            {socialProviders.includes("google") ? (
+              <SocialButton onClick={() => void beginSocialAuth("google")} disabled={!runtimeConfigLoaded || authBusy || desktopRedirectBusy}>
+                <GoogleLogo />
+                <span>Continue with Google</span>
+              </SocialButton>
+            ) : null}
+            {socialProviders.includes("github") ? (
+              <SocialButton onClick={() => void beginSocialAuth("github")} disabled={!runtimeConfigLoaded || authBusy || desktopRedirectBusy}>
+                <GitHubLogo />
+                <span>Continue with GitHub</span>
+              </SocialButton>
+            ) : null}
+            <div className="den-divider" aria-hidden="true">
+              <span>or</span>
+            </div>
+          </div>
+        ) : null}
 
         {desktopAuthRequested && desktopRedirectUrl ? (
           <DesktopHandoffAction
@@ -716,8 +768,11 @@ export function AuthPanel({
               disabled={emailFirstFormBusy}
             >
               {loginOptionBusy ? "Checking..." : "Next"}
-              {!loginOptionBusy ? <ArrowRight className="h-4 w-4" /> : null}
+              {!loginOptionBusy && !socialFirst ? <ArrowRight className="h-4 w-4" /> : null}
             </button>
+            {socialFirst && emailStepContent?.copy ? (
+              <p className="m-0 text-[13px] leading-5 text-[var(--dls-text-secondary)]">{emailStepContent.copy}</p>
+            ) : null}
           </form>
         ) : null}
 
@@ -795,12 +850,24 @@ export function AuthPanel({
 
         {!waitingForPrefilledLoginOption && emailFirstStep === "new_account" ? (
           <form
+            data-testid="signup-new-account"
             className="grid gap-4"
             onSubmit={async (event) => {
               const next = await submitAuth(event);
               await handleAuthNavigation(next);
             }}
           >
+            <label className="grid gap-2">
+              <span className="den-label">Name</span>
+              <input
+                className="den-input"
+                type="text"
+                value={authName}
+                onChange={(event) => setAuthName(event.target.value)}
+                autoComplete="name"
+                required
+              />
+            </label>
             {!hideEmailField ? (
               <label className="grid gap-2">
                 <span className="den-label">Email</span>
@@ -817,16 +884,22 @@ export function AuthPanel({
               </label>
             ) : null}
             <label className="grid gap-2">
-              <span className="den-label">Name</span>
+              <span className="den-label">Password</span>
               <input
                 className="den-input"
-                type="text"
-                value={authName}
-                onChange={(event) => setAuthName(event.target.value)}
-                autoComplete="name"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="new-password"
+                aria-invalid={signupPasswordFeedback.length > 0}
                 required
               />
+              <PasswordFeedbackList messages={signupPasswordFeedback} />
             </label>
+            <button type="submit" className="den-button-primary w-full" disabled={formBusy}>
+              {formBusy ? "Working..." : activeContent.submitLabel}
+              {!formBusy ? <ArrowRight className="h-4 w-4" /> : null}
+            </button>
             {!hideSocialAuth ? (
               <>
                 <div className="den-divider" aria-hidden="true">
@@ -841,23 +914,6 @@ export function AuthPanel({
                 </SocialButton>
               </>
             ) : null}
-            <label className="grid gap-2">
-              <span className="den-label">Password</span>
-              <input
-                className="den-input"
-                type="password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                autoComplete="new-password"
-                aria-invalid={signupPasswordFeedback.length > 0}
-                required
-              />
-              <PasswordFeedbackList messages={signupPasswordFeedback} />
-            </label>
-            <button type="submit" className="den-button-primary w-full" disabled={formBusy}>
-              {formBusy ? "Working..." : "Sign up"}
-              {!formBusy ? <ArrowRight className="h-4 w-4" /> : null}
-            </button>
           </form>
         ) : null}
 
@@ -866,8 +922,13 @@ export function AuthPanel({
             className="den-frame-inset grid gap-1 rounded-[1.5rem] px-4 py-3 text-center text-[13px] text-[var(--dls-text-secondary)]"
             aria-live="polite"
           >
-            {loginOptionError ? <p className="font-medium text-rose-600">{loginOptionError}</p> : <p>{authInfo}</p>}
-            {!loginOptionError && authError ? <p className="font-medium text-rose-600">{authError}</p> : null}
+            {loginOptionError ? (
+              <p className="font-medium text-rose-600">{loginOptionError}</p>
+            ) : authError ? (
+              <p className="font-medium text-rose-600">{authError}</p>
+            ) : (
+              <p>{authInfo}</p>
+            )}
           </div>
         ) : null}
       </div>
@@ -876,13 +937,15 @@ export function AuthPanel({
 
   return (
     <div className={shellClass("gap-4 sm:gap-5", "p-5 sm:p-6 md:p-7")}>
-      <div className="grid gap-3">
-        <p className="den-eyebrow">{eyebrow}</p>
-        <div className="grid gap-2">
-          <h2 className="den-title-lg">{activeContent.title}</h2>
-          <p className="den-copy">{activeContent.copy}</p>
+      {!hideIntro ? (
+        <div className="grid gap-3">
+          <p className="den-eyebrow">{eyebrow}</p>
+          <div className="grid gap-2">
+            <h2 className={titleClass}>{activeContent.title}</h2>
+            <p className="den-copy">{activeContent.copy}</p>
+          </div>
         </div>
-      </div>
+      ) : null}
 
       {showModeTabs ? (
         <div

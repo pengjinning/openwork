@@ -33,12 +33,24 @@ export function PlainText({ content, className, ...props }: PlainTextProps) {
 
 interface MarkdownPreviewProps extends React.ComponentProps<"div"> {
   content: string;
+  mermaidSource?: boolean;
 }
 
-export function MarkdownPreview({ content, className, ...props }: MarkdownPreviewProps) {
+function mermaidSourceMarkdown(content: string) {
+  let longestBacktickRun = 2;
+  let currentBacktickRun = 0;
+  for (const character of content) {
+    currentBacktickRun = character === "`" ? currentBacktickRun + 1 : 0;
+    if (currentBacktickRun > longestBacktickRun) longestBacktickRun = currentBacktickRun;
+  }
+  const fence = "`".repeat(longestBacktickRun + 1);
+  return `${fence}mermaid\n${content}\n${fence}`;
+}
+
+export function MarkdownPreview({ content, mermaidSource = false, className, ...props }: MarkdownPreviewProps) {
   return (
-    <div data-openwork-markdown-preview="" className={cn("h-full overflow-auto p-4", className)} {...props}>
-      <MarkdownBlock text={content} />
+    <div data-openwork-markdown-preview="" data-openwork-mermaid-artifact={mermaidSource ? "" : undefined} className={cn("h-full overflow-auto p-4", className)} {...props}>
+      <MarkdownBlock text={mermaidSource ? mermaidSourceMarkdown(content) : content} />
     </div>
   );
 }
@@ -57,12 +69,17 @@ interface BinaryHTMLPreviewProps {
 
 type HTMLPreviewProps = { className?: string } & (TextHTMLPreviewProps | BinaryHTMLPreviewProps);
 
+// Workspace HTML is untrusted. srcdoc and app-created blob: URLs inherit the
+// app's origin, so the frame must never get allow-same-origin: it would run as
+// the main window and reach the desktop bridge. Scripts run in an opaque origin.
+export const HTML_PREVIEW_SANDBOX = "allow-scripts";
+
 export function HTMLPreview({ className, ...props }: HTMLPreviewProps) {
   if (props.type === "text") {
-    return <iframe srcDoc={props.content} title={props.title} className={cn("h-full w-full border-0", className)} sandbox="allow-scripts allow-same-origin" />;
+    return <iframe srcDoc={props.content} title={props.title} className={cn("h-full w-full border-0", className)} sandbox={HTML_PREVIEW_SANDBOX} />;
   }
 
-  return <iframe src={props.url} title={props.title} className={cn("h-full w-full border-0", className)} sandbox="allow-scripts allow-same-origin" />;
+  return <iframe src={props.url} title={props.title} className={cn("h-full w-full border-0", className)} sandbox={HTML_PREVIEW_SANDBOX} />;
 }
 
 interface PdfPreviewProps {
@@ -75,7 +92,7 @@ export function PdfPreview({ url, title, className }: PdfPreviewProps) {
   // Chromium's built-in PDF viewer (enabled via webPreferences.plugins) renders
   // reliably through <embed>; <object>/sandboxed <iframe> show a blank frame.
   // The blob URL comes from a trusted workspace file.
-  return <embed src={url} type="application/pdf" title={title} className={cn("h-full w-full border-0", className)} />;
+  return <embed src={url} type="application/pdf" title={title} data-testid="artifact-pdf-preview" className={cn("h-full w-full border-0", className)} />;
 }
 
 interface ImagePreviewProps extends React.ComponentProps<"div"> {

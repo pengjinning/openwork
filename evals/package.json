@@ -3,29 +3,47 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "spec": "vitest run --config vitest.config.ts --project pr",
-    "spec:stack": "vitest run --config vitest.config.ts",
-    "roll": "node packages/evidence/bin/roll.mjs",
-    "publish:pr": "node packages/evidence/bin/publish-pr.mjs",
+    "test:pr": "vitest run --config vitest.config.ts --project pr",
+    "test:pr:coverage": "vitest run --config vitest.config.ts --project pr --coverage.enabled=true --coverage.provider=v8 --coverage.reporter=text-summary --coverage.reporter=lcov --coverage.reportsDirectory=./coverage",
+    "test:e2e": "vitest run --config vitest.config.ts --project e2e",
+    "artifacts:index": "node packages/test-artifacts/bin/artifact-index.mjs",
+    "artifacts:publish": "node packages/test-artifacts/bin/publish-pr.mjs",
     "dev:den": "node scripts/dev-den.ts",
-    "fraimz:publish": "node packages/evidence/bin/publish-pr.mjs",
-    "fraimz:judge": "node packages/fraimz/bin/judge.mjs",
+    "docs:shots": "node docs-shots/run.ts",
+    "evidence:judge": "node packages/test-evidence/bin/test-evidence-judge.mjs",
+    "design:review": "node packages/test-evidence/bin/test-evidence-design-review.mjs",
     "provision:org-connector-two-members": "node scripts/provision-org-connector-two-members.ts",
-    "test": "node --test runner/*.test.ts packages/*/test/*.test.ts bin/*.test.mjs",
-    "typecheck": "tsc -p ."
+    "lint:layers": "depcruise --config .dependency-cruiser.cjs --ignore-known .dependency-cruiser-known-violations.json packages specs worlds bin docs-shots runner scripts ../scenarios",
+    "check": "pnpm run check:browser && pnpm run lint:layers && node scripts/spec-channel-ratchet.mjs && node scripts/spec-boundary-ratchet.mjs",
+    "typecheck": "node scripts/typecheck.mjs",
+    "typecheck:spec-layer": "tsc -p tsconfig.primitives.json",
+    "test:core": "vitest run --config vitest.config.ts --project pr specs/thread-approvals-replay.test.ts specs/effective-permissions-attribution.test.ts specs/pdf-attachments-model-routing.test.ts specs/route-session-list.test.ts ../apps/server/test/session-title-sigv4.vitest.test.ts specs/bedrock-title-signing.test.ts specs/session-title-recovery.test.ts",
+    "check:browser": "node scripts/check-browser-code.mjs"
   },
   "dependencies": {
     "@openwork/behaviors": "workspace:*",
     "@openwork/cdp": "workspace:*",
-    "@openwork/evidence": "workspace:*",
-    "@openwork/fraimz": "workspace:*",
+    "@openwork/env": "workspace:*",
     "@openwork/hosts": "workspace:*",
     "@openwork/labs": "workspace:*",
     "@openwork/matchers": "workspace:*",
-    "@openwork/testkit": "workspace:*"
+    "@openwork/review": "link:../packages/review",
+    "@openwork/sdk": "link:../packages/sdk",
+    "@openwork/design-review": "workspace:*",
+    "@openwork/test-artifacts": "workspace:*",
+    "@openwork/test-evidence": "workspace:*",
+    "@openwork/testkit": "workspace:*",
+    "@openwork/types": "link:../packages/types",
+    "@openwork/world": "link:../packages/world"
   },
   "devDependencies": {
-    "vitest": "^3.2.4"
+    "@vitest/coverage-v8": "^4.1.11",
+    "dependency-cruiser": "18.1.0",
+    "typescript": "^5.9.3",
+    "vite": "^6.4.3",
+    "vitest": "^4.1.11",
+    "xml-crypto": "6.1.2",
+    "zod": "^4.4.3"
   },
   "packageManager": "pnpm@11.4.0"
 }

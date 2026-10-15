@@ -24,7 +24,6 @@ export type AddMcpModalProps = {
   onClose: () => void;
   onAdd: (entry: McpDirectoryInfo) => Promise<McpConnectResult>;
   busy: boolean;
-  isRemoteWorkspace: boolean;
 };
 
 type AddMcpState = {
@@ -198,25 +197,16 @@ export function AddMcpModal(props: AddMcpModalProps) {
               </button>
               <button
                 type="button"
-                disabled={props.isRemoteWorkspace}
                 className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                   state.serverType === "local"
                     ? "bg-dls-active text-dls-text"
                     : "text-dls-secondary hover:text-dls-text hover:bg-dls-hover"
-                } ${props.isRemoteWorkspace ? "opacity-50 cursor-not-allowed" : ""}`}
-                onClick={() => {
-                  if (props.isRemoteWorkspace) return;
-                  dispatch({ serverType: "local" });
-                }}
+                }`}
+                onClick={() => dispatch({ serverType: "local" })}
               >
                 {t("mcp.type_local_cmd")}
               </button>
             </div>
-            {props.isRemoteWorkspace ? (
-              <div className="mt-2 text-[11px] text-dls-secondary">
-                {t("mcp.remote_workspace_url_hint")}
-              </div>
-            ) : null}
           </div>
 
           {state.serverType === "remote" ? (
@@ -230,7 +220,7 @@ export function AddMcpModal(props: AddMcpModalProps) {
               <div className="text-[11px] text-dls-secondary">
                 {t("mcp.oauth_autodetect_hint")}
               </div>
-              {!props.isRemoteWorkspace ? <div className="rounded-xl border border-dls-border bg-dls-hover/30">
+              <div className="rounded-xl border border-dls-border bg-dls-hover/30">
                 <button
                   type="button"
                   className="flex w-full items-center justify-between px-3 py-2 text-left text-xs font-medium text-dls-text"
@@ -263,12 +253,12 @@ export function AddMcpModal(props: AddMcpModalProps) {
                       value={state.oauthScope}
                       onChange={(event) => dispatch({ oauthScope: event.currentTarget.value })}
                     />
-                    <div className="rounded-lg border border-amber-6 bg-amber-2 px-3 py-2 text-[11px] leading-relaxed text-amber-11">
+                    <div className="rounded-lg border border-border bg-muted/30 px-3 py-2 text-[11px] leading-relaxed text-foreground">
                       {t("mcp.oauth_secret_warning")}
                     </div>
                   </div>
                 ) : null}
-              </div> : null}
+              </div>
             </div>
           ) : null}
 

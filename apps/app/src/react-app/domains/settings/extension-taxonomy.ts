@@ -3,27 +3,37 @@ import { t } from "../../../i18n";
 
 /**
  * What a user sees on an inventory row:
- * - app: a runtime that runs on this device (Ollama, Computer Use, Browser, Voice)
+ * - app: a runtime that runs on this device (Ollama, Browser)
  * - connection: an account, shared by an organization or signed in by the member
  * - mcp: an MCP server configured in this workspace
- * - skill / plugin: installed workflows and organization bundles
+ * - skill / command / agent: composer capabilities managed in Library
+ * - plugin: organization bundles
  */
-export type ExtensionTaxonomy = "app" | "connection" | "mcp" | "skill" | "plugin";
+export type ExtensionTaxonomy = "app" | "connection" | "mcp" | "skill" | "command" | "agent" | "plugin";
 
 export type ExtensionInventoryFilter = "all" | ExtensionTaxonomy;
 
 export type ExtensionTransport = "mcp" | "native" | null;
 
-export type ExtensionInventoryState = "all" | "needs_signin" | "needs_admin_setup" | "ready";
+export type ExtensionInventoryState = "all" | "needs_signin" | "needs_admin_setup" | "ready" | "available" | "disabled";
 
 export const extensionInventoryFilters: ExtensionInventoryFilter[] = [
   "all",
-  "app",
   "connection",
-  "mcp",
   "skill",
   "plugin",
 ];
+
+/**
+ * Legacy routes remain valid, but only these three categories are primary.
+ * Commands and agents stay composer capabilities (/command, @agent) with
+ * direct-link detail pages; their old routes land on Skills.
+ */
+export function primaryLibraryFilter(filter?: ExtensionInventoryFilter): ExtensionInventoryFilter {
+  if (filter === "skill" || filter === "command" || filter === "agent") return "skill";
+  if (filter === "connection" || filter === "mcp") return "connection";
+  return filter === "plugin" ? "plugin" : "all";
+}
 
 /** Built-ins ship with OpenWork and run here, so they are apps. Accounts arrive as org connections. */
 export function taxonomyForDirectoryEntry(entry: McpDirectoryInfo): ExtensionTaxonomy {
@@ -31,12 +41,24 @@ export function taxonomyForDirectoryEntry(entry: McpDirectoryInfo): ExtensionTax
   return "mcp";
 }
 
+/**
+ * The MCPs category lists third-party servers only. OpenWork's own runtimes
+ * (the browser panel, Ollama, UI control) and auto-managed
+ * plumbing such as Cloud Control are app functionality, not MCPs to browse;
+ * their setup pages stay reachable by direct link.
+ */
+export function isLibraryMcpDirectoryEntry(entry: McpDirectoryInfo): boolean {
+  return taxonomyForDirectoryEntry(entry) === "mcp" && entry.defaultHidden !== true;
+}
+
 export function matchesExtensionFilter(
   filter: ExtensionInventoryFilter,
   taxonomy: ExtensionTaxonomy,
   transport: ExtensionTransport = null,
 ) {
-  return filter === "all" || filter === taxonomy || (filter === "mcp" && transport === "mcp");
+  if (filter === "all" || filter === taxonomy) return true;
+  const connector = taxonomy === "connection" || taxonomy === "mcp" || transport === "mcp";
+  return (filter === "mcp" || filter === "connection") && connector;
 }
 
 export function extensionFilterLabel(filter: ExtensionInventoryFilter) {
@@ -51,6 +73,10 @@ export function extensionFilterLabel(filter: ExtensionInventoryFilter) {
       return t("extensions.filter_mcps");
     case "skill":
       return t("extensions.filter_skills");
+    case "command":
+      return t("extensions.filter_commands");
+    case "agent":
+      return t("extensions.filter_agents");
     case "plugin":
       return t("extensions.filter_plugins");
   }
@@ -66,6 +92,10 @@ export function extensionTaxonomyLabel(taxonomy: ExtensionTaxonomy) {
       return t("extensions.badge_mcp");
     case "skill":
       return t("extensions.badge_skill");
+    case "command":
+      return t("extensions.badge_command");
+    case "agent":
+      return t("extensions.badge_agent");
     case "plugin":
       return t("extensions.badge_plugin");
   }

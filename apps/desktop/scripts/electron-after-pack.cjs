@@ -1,12 +1,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnSync } = require("node:child_process");
 const asar = require("@electron/asar");
-
-const computerUseHelperAppName = "OpenWork Computer Use.app";
 
 const sidecarBases = [
   "opencode",
+  "opencode2",
 ];
 
 function targetTriple(platformName, arch) {
@@ -53,12 +51,20 @@ function resolveAppAsarPath(context) {
   return path.join(context.appOutDir, "resources", "app.asar");
 }
 
+function normalizeAsarEntryPath(entry, separator) {
+  return entry.split(separator).join("/");
+}
+
 function verifyRuntimeDependencies(context) {
   const appAsarPath = resolveAppAsarPath(context);
   if (!appAsarPath || !fs.existsSync(appAsarPath)) {
     throw new Error(`Missing packaged app.asar at ${appAsarPath || context.appOutDir}`);
   }
-  const packagedFiles = new Set(asar.listPackage(appAsarPath));
+  const packagedFiles = new Set(
+    asar
+      .listPackage(appAsarPath, { isPack: false })
+      .map((entry) => normalizeAsarEntryPath(entry, path.sep)),
+  );
   const stagedNodeModules = path.resolve(__dirname, "..", ".electron-runtime", "node_modules");
   const packageJsonPaths = [];
   function visitNodeModules(nodeModulesPath, archivePrefix) {
@@ -87,30 +93,6 @@ function verifyRuntimeDependencies(context) {
     if (!packagedFiles.has(packageJsonPath)) {
       throw new Error(`Missing staged MCP runtime package from app.asar: ${packageJsonPath}`);
     }
-  }
-}
-
-function signComputerUseHelper(context) {
-  const appPath = resolveMacAppPath(context);
-  if (!appPath) return;
-
-  const helperPath = path.join(appPath, "Contents", "Resources", "helpers", computerUseHelperAppName);
-  if (!fs.existsSync(helperPath)) {
-    throw new Error(`Missing Computer Use helper app at ${helperPath}`);
-  }
-
-  const identity = process.env.OPENWORK_COMPUTER_USE_CODESIGN_IDENTITY
-    || process.env.CSC_NAME
-    || process.env.APPLE_CODESIGN_IDENTITY
-    || "-";
-  const args = ["--force", "--deep", "--options", "runtime", "--sign", identity];
-  if (identity !== "-") args.push("--timestamp");
-  args.push(helperPath);
-
-  const result = spawnSync("codesign", args, { stdio: "inherit" });
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`codesign failed for Computer Use helper app with status ${result.status}`);
   }
 }
 
@@ -164,9 +146,8 @@ async function afterPack(context) {
       fs.rmSync(path.join(sidecarsDir, entry), { force: true, recursive: true });
     }
   }
-
-  signComputerUseHelper(context);
 }
 
 module.exports = afterPack;
 module.exports.default = afterPack;
+module.exports.normalizeAsarEntryPath = normalizeAsarEntryPath;

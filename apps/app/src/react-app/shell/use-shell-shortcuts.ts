@@ -16,6 +16,14 @@ import {
   type SessionNumberShortcutTarget,
   type SessionNumberShortcutTransition,
 } from "./session-number-shortcuts";
+import {
+  getThinkingModeShortcutDirection,
+  resolveThinkingModeShortcutOs,
+  type ThinkingModeShortcutDirection,
+} from "./thinking-mode-shortcut";
+import { isFavoriteModelShortcut } from "./favorite-model-shortcut";
+import { isCycleModelSourceShortcut } from "@/react-app/domains/models/model-catalog";
+import { isFastModeShortcut } from "./fast-mode-shortcut";
 
 export type UseShellShortcutsInput = {
   canCreateTask: boolean;
@@ -23,6 +31,10 @@ export type UseShellShortcutsInput = {
   onCreateTask: (workspaceId: string) => void | Promise<void>;
   onNextSessionTab?: () => void;
   onPrevSessionTab?: () => void;
+  onCycleThinkingMode?: (direction: ThinkingModeShortcutDirection) => void;
+  onCycleFavoriteModel?: () => void;
+  onCycleModelSource?: () => void;
+  onToggleFastMode?: () => void;
 };
 
 export function useCommandPaletteShortcut(enabled = true) {
@@ -47,7 +59,16 @@ export function useCommandPaletteShortcut(enabled = true) {
 
 export function useShellShortcuts(input: UseShellShortcutsInput) {
   const platform = usePlatform();
-  const { canCreateTask, workspaceId, onCreateTask, onNextSessionTab, onPrevSessionTab } = input;
+  const {
+    canCreateTask,
+    workspaceId,
+    onCreateTask,
+    onNextSessionTab,
+    onPrevSessionTab,
+    onCycleThinkingMode,
+    onCycleFavoriteModel,
+    onToggleFastMode,
+  } = input;
   const { commandPaletteOpen, setCommandPaletteOpen } = useCommandPaletteShortcut();
   const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
@@ -56,6 +77,10 @@ export function useShellShortcuts(input: UseShellShortcutsInput) {
   const sessionNumberCancelledRef = useRef(false);
   const sessionNumberModifierHeldRef = useRef(false);
   const sessionNumberOs: SessionNumberShortcutOs = resolveSessionNumberShortcutOs(
+    platform.os,
+    typeof navigator === "undefined" ? "" : navigator.platform,
+  );
+  const thinkingModeShortcutOs = resolveThinkingModeShortcutOs(
     platform.os,
     typeof navigator === "undefined" ? "" : navigator.platform,
   );
@@ -93,8 +118,34 @@ export function useShellShortcuts(input: UseShellShortcutsInput) {
   //   Cmd/Ctrl+Shift+F  -> search every session (titles + messages)
   //   Cmd/Ctrl+T        -> next session tab
   //   Cmd/Ctrl+Shift+T  -> previous session tab
+  //   Ctrl+T / Ctrl+Shift+T (macOS) -> next / previous thinking mode
+  //   Ctrl+Alt+T / Ctrl+Alt+Shift+T (Windows/Linux) -> next / previous thinking mode
+  //   Ctrl+Shift+M      -> next favorite model
+  //   Ctrl+Shift+F (macOS) / Ctrl+Alt+F (Windows/Linux) -> toggle Fast
   //   Cmd/Ctrl+1–9      -> matching visible sidebar session
   const handleGlobalShortcut = useEffectEvent((event: KeyboardEvent) => {
+    if (event.defaultPrevented) return;
+    if (isCycleModelSourceShortcut(event)) {
+      event.preventDefault();
+      if (!event.repeat) input.onCycleModelSource?.();
+      return;
+    }
+    if (isFavoriteModelShortcut(event)) {
+      event.preventDefault();
+      if (!event.repeat) onCycleFavoriteModel?.();
+      return;
+    }
+    if (isFastModeShortcut(event, thinkingModeShortcutOs)) {
+      event.preventDefault();
+      if (!event.repeat) onToggleFastMode?.();
+      return;
+    }
+    const thinkingModeDirection = getThinkingModeShortcutDirection(event, thinkingModeShortcutOs);
+    if (thinkingModeDirection) {
+      event.preventDefault();
+      if (!event.repeat) onCycleThinkingMode?.(thinkingModeDirection);
+      return;
+    }
     const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
     const mod = isMac ? event.metaKey : event.ctrlKey;
     if (!mod) return;

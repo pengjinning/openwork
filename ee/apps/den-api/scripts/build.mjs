@@ -44,16 +44,30 @@ function writeGeneratedVersionFile(latestAppVersion) {
   )
 }
 
-function run(command, args) {
+function run(command, args, env = process.env) {
   const result = spawnSync(command, args, {
     cwd: serviceDir,
-    env: process.env,
+    env,
     stdio: "inherit",
   })
 
   if (result.status !== 0) {
     process.exit(result.status ?? 1)
   }
+}
+
+// Even with shared declaration boundaries, den-api exceeds Node's default
+// heap cap. Raise only the tsc heap; an explicit
+// --max-old-space-size in NODE_OPTIONS, or DEN_API_TSC_MAX_OLD_SPACE_MB, wins.
+export const tscHeapEnvFlag = "DEN_API_TSC_MAX_OLD_SPACE_MB"
+export const defaultTscHeapMb = 6144
+
+export function tscBuildEnv(env = process.env) {
+  const nodeOptions = env.NODE_OPTIONS?.trim() ?? ""
+  if (/--max-old-space-size[= ]/.test(nodeOptions)) return env
+  const override = Number.parseInt(env[tscHeapEnvFlag] ?? "", 10)
+  const heapMb = Number.isInteger(override) && override > 0 ? override : defaultTscHeapMb
+  return { ...env, NODE_OPTIONS: [nodeOptions, `--max-old-space-size=${heapMb}`].filter(Boolean).join(" ") }
 }
 
 export function envFlagEnabled(value) {
@@ -77,6 +91,86 @@ export function requireSentrySourcemapUploadEnv(env = process.env) {
 
 function cleanDist() {
   rmSync(distDir, { recursive: true, force: true })
+}
+
+function productionExportTarget(value) {
+  if (typeof value === "string") {
+    return value
+  }
+  if (Array.isArray(value)) {
+    return value.map(productionExportTarget).find(Boolean)
+  }
+  if (!value || typeof value !== "object") {
+    return undefined
+  }
+
+  for (const [condition, target] of Object.entries(value)) {
+    if (["node", "import", "default"].includes(condition)) {
+      const resolved = productionExportTarget(target)
+      if (resolved) return resolved
+    }
+  }
+  return undefined
+}
+
+function missingWorkspaceExports(packageDir, checkExport) {
+  const visited = new Set()
+  const missing = []
+
+  function visit(currentDir) {
+    const packageJsonPath = path.join(currentDir, "package.json")
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8"))
+    if (visited.has(packageJson.name)) return
+    visited.add(packageJson.name)
+
+    for (const [dependency, version] of Object.entries(packageJson.dependencies ?? {})) {
+      if (typeof version !== "string" || !version.startsWith("workspace:")) continue
+
+      const dependencyDir = path.dirname(path.join(currentDir, "node_modules", dependency, "package.json"))
+      const dependencyPackageJson = JSON.parse(readFileSync(path.join(dependencyDir, "package.json"), "utf8"))
+      const exports = dependencyPackageJson.exports
+      const exportEntries = exports && typeof exports === "object" && !Array.isArray(exports)
+        && Object.keys(exports).some((key) => key.startsWith("."))
+        ? Object.entries(exports)
+        : [[".", exports]]
+
+      for (const [subpath, value] of exportEntries) {
+        const problem = checkExport(value, dependencyDir)
+        if (problem) missing.push(`${dependency}${subpath === "." ? "" : subpath.slice(1)}: ${problem}`)
+      }
+      visit(dependencyDir)
+    }
+  }
+
+  visit(packageDir)
+  return missing.sort()
+}
+
+export function missingProductionWorkspaceExports(packageDir = serviceDir) {
+  return missingWorkspaceExports(packageDir, (value, dependencyDir) => {
+    const target = productionExportTarget(value)
+    return target && !existsSync(path.resolve(dependencyDir, target)) ? target : undefined
+  })
+}
+
+export function missingProductionWorkspaceTypes(packageDir = serviceDir) {
+  return missingWorkspaceExports(packageDir, (value, dependencyDir) => {
+    const types = value?.types
+    if (!types) {
+      const target = productionExportTarget(value)
+      return /\.tsx?$/.test(target ?? "") ? "missing openwork-build declaration export" : undefined
+    }
+    const target = typeof types === "string" ? types : types["openwork-build"]
+    if (!target?.endsWith(".d.ts")) return "missing openwork-build declaration export"
+    return existsSync(path.resolve(dependencyDir, target)) ? undefined : target
+  })
+}
+
+function verifyProductionWorkspaceExports() {
+  const missing = [...missingProductionWorkspaceExports(), ...missingProductionWorkspaceTypes()]
+  if (missing.length > 0) {
+    throw new Error(`Workspace production exports are missing:\n${missing.map((entry) => `- ${entry}`).join("\n")}`)
+  }
 }
 
 function maybeUploadSentrySourcemaps() {
@@ -109,16 +203,9 @@ function main() {
   writeGeneratedVersionFile(process.env.DEN_API_LATEST_APP_VERSION)
   cleanDist()
 
-  run(pnpmCommand, ["run", "build:types"])
-  run(pnpmCommand, ["run", "build:automations"])
-  run(pnpmCommand, ["run", "build:connect-link"])
-  run(pnpmCommand, ["run", "build:email"])
-  run(pnpmCommand, ["run", "build:install-config"])
-  run(pnpmCommand, ["run", "build:enterprise-mcp-client"])
-  run(pnpmCommand, ["run", "build:codemode"])
-  run(pnpmCommand, ["run", "build:headless-threads"])
-  run(pnpmCommand, ["run", "build:den-db"])
-  run(pnpmCommand, ["exec", "tsc", "-p", "tsconfig.json"])
+  run(pnpmCommand, ["run", "build:workspace-dependencies"])
+  verifyProductionWorkspaceExports()
+  run(pnpmCommand, ["exec", "tsc", "-p", "tsconfig.build.json"], tscBuildEnv())
   maybeUploadSentrySourcemaps()
 }
 

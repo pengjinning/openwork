@@ -1,5 +1,4 @@
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js"
-
+import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client"
 import type { EnterpriseMcpOperationPhase, EnterpriseMcpRequestPhase } from "./contracts.js"
 
 export type EnterpriseMcpErrorCode =
@@ -32,7 +31,7 @@ const phaseLabel: Record<EnterpriseMcpOperationPhase, string> = {
   "requirements-discovery": "MCP connection requirements discovery",
   "connection-handshake": "MCP connection handshake",
   "authorization-callback": "OAuth authorization callback",
-  "protocol-initialize": "MCP protocol initialization",
+  "protocol-initialize": "MCP protocol negotiation",
   "tool-discovery": "MCP tool discovery",
   "tool-execution": "MCP tool execution",
   "resource-discovery": "MCP resource discovery",
@@ -47,6 +46,7 @@ const requestPhaseLabel: Record<EnterpriseMcpRequestPhase, string> = {
   "oauth-client-registration": "OAuth client registration",
   "oauth-token-exchange": "OAuth token exchange",
   "oauth-token-refresh": "OAuth token refresh",
+  "mcp-discovery": "the MCP server/discover request",
   "mcp-initialize": "the MCP initialize request",
   "mcp-tool-discovery": "the MCP tools/list request",
   "mcp-tool-execution": "the MCP tools/call request",
@@ -76,17 +76,17 @@ export class EnterpriseMcpClientError extends Error {
 
 /**
  * Marks a lifecycle abort as ours on the `data` of an MCP error. The SDK
- * rethrows an `McpError` untouched but collapses any other abort reason into
+ * rethrows an `SdkError` untouched but collapses any other abort reason into
  * `String(reason)` on a RequestTimeout, leaving downstream diagnostics unable
  * to tell an OpenWork deadline apart from a provider-declared failure.
  */
 export const ENTERPRISE_MCP_LIFECYCLE_DEADLINE_DATA_KEY = "enterpriseMcpLifecycleDeadline"
 
-export class EnterpriseMcpLifecycleDeadlineError extends McpError {
+export class EnterpriseMcpLifecycleDeadlineError extends SdkError {
   readonly operationPhase: EnterpriseMcpOperationPhase
 
   constructor(operationPhase: EnterpriseMcpOperationPhase) {
-    super(ErrorCode.RequestTimeout, `Enterprise MCP ${operationPhase} exceeded its lifecycle deadline.`, {
+    super(SdkErrorCode.RequestTimeout, `Enterprise MCP ${operationPhase} exceeded its lifecycle deadline.`, {
       [ENTERPRISE_MCP_LIFECYCLE_DEADLINE_DATA_KEY]: true,
       operationPhase,
     })
@@ -121,8 +121,10 @@ export type EnterpriseMcpOAuthContractErrorCode =
   | "MCP_OAUTH_AUTHORIZATION_EXPIRED"
   | "MCP_OAUTH_AUTHORIZATION_CLIENT_CHANGED"
   | "MCP_OAUTH_CLIENT_EXPIRED"
+  | "MCP_OAUTH_CLIENT_REJECTED"
   | "MCP_OAUTH_CREDENTIAL_EXPIRED"
   | "MCP_OAUTH_CREDENTIAL_CHANGED"
+  | "MCP_OAUTH_CONFIGURATION_CHANGED"
   | "MCP_OAUTH_CONFIGURATION_REQUIRED"
   | "MCP_OAUTH_ISSUER_MISMATCH"
   | "MCP_OAUTH_PERSISTENCE_INVALID"
@@ -142,6 +144,8 @@ export class EnterpriseMcpOAuthContractError extends Error {
 export class EnterpriseMcpToolResultError extends Error {
   readonly code = "MCP_TOOL_REPORTED_ERROR"
   readonly providerSignal: Record<string, unknown> | undefined
+  /** The provider's own explanation of the failure. Untrusted: the host redacts and shortens it before showing it, and it never enters the message or diagnostic events. */
+  readonly providerText: string[]
 
   constructor(result?: unknown) {
     super("The MCP provider completed the request but reported that the tool operation failed.")
@@ -153,13 +157,15 @@ export class EnterpriseMcpToolResultError extends Error {
     const content = typeof result === "object" && result !== null && "content" in result && Array.isArray(result.content)
       ? result.content
       : []
-    const hasStandardInputValidationError = content.some((item) => {
-      if (typeof item !== "object" || item === null || !("type" in item) || item.type !== "text" || !("text" in item) || typeof item.text !== "string") {
-        return false
-      }
-      return /^Input validation error:\s*Invalid arguments for tool\b/i.test(item.text)
-        || /^Invalid (?:tool )?(?:arguments|params)\b/i.test(item.text)
-    })
+    this.providerText = content.flatMap((item) => (
+      typeof item === "object" && item !== null && "type" in item && item.type === "text" && "text" in item && typeof item.text === "string"
+        ? [item.text]
+        : []
+    ))
+    const hasStandardInputValidationError = this.providerText.some((text) => (
+      /^Input validation error:\s*Invalid arguments for tool\b/i.test(text)
+        || /^Invalid (?:tool )?(?:arguments|params)\b/i.test(text)
+    ))
     const providerStatus = structuredContent && "providerStatus" in structuredContent && typeof structuredContent.providerStatus === "number"
       ? structuredContent.providerStatus
       : undefined

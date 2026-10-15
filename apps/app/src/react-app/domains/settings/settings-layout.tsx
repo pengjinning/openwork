@@ -11,12 +11,13 @@ export function LayoutStack({ children, className }: LayoutStackProps) {
 }
 
 interface LayoutSectionProps {
+  id?: string;
   children: React.ReactNode;
 }
 
-export function LayoutSection({ children }: LayoutSectionProps) {
+export function LayoutSection({ children, id }: LayoutSectionProps) {
   return (
-    <div data-section className="group/section flex flex-col gap-6">
+    <div id={id} tabIndex={id ? -1 : undefined} data-section className="group/section flex scroll-mt-6 flex-col gap-6">
       {children}
     </div>
   );
@@ -57,19 +58,6 @@ export function LayoutSectionDescription({ children, className }: LayoutSectionD
     <p className={cn("text-sm text-muted-foreground", className)}>
       {children}
     </p>
-  );
-}
-
-interface LayoutSectionContentProps {
-  children: React.ReactNode;
-  className?: string;
-}
-
-export function LayoutSectionContent({ children, className }: LayoutSectionContentProps) {
-  return (
-    <div className={cn("flex flex-col gap-1", className)}>
-      {children}
-    </div>
   );
 }
 
@@ -133,19 +121,6 @@ interface LayoutSectionItemHeaderActionsProps {
 export function LayoutSectionItemHeaderActions({ children, className }: LayoutSectionItemHeaderActionsProps) {
   return (
     <div data-slot="item-header-actions" className={cn("col-start-2 row-span-2 row-start-1 flex flex-wrap items-center gap-2 self-start justify-self-end", className)}>
-      {children}
-    </div>
-  );
-}
-
-interface LayoutSectionItemContentProps {
-  children: React.ReactNode;
-  className?: string;
-}
-
-export function LayoutSectionItemContent({ children, className }: LayoutSectionItemContentProps) {
-  return (
-    <div className={cn("flex flex-col gap-1", className)}>
       {children}
     </div>
   );

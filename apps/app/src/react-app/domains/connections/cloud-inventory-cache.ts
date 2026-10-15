@@ -57,11 +57,14 @@ type CacheSlot<T> = {
 type ScopedCache<T, C> = {
   read: (scope: CloudInventoryScope) => T | null;
   load: (input: { client: C; scope: CloudInventoryScope; maxAgeMs?: number }) => Promise<T>;
+  /** Stores an answer fetched elsewhere, unless a load for this scope is in flight. */
+  seed: (scope: CloudInventoryScope, value: T) => void;
   clear: () => void;
 };
 
 function createScopedCache<T, C>(
   fetcher: (input: { client: C; scope: CloudInventoryScope }) => Promise<T>,
+  options?: { isFresh?: (value: T) => boolean },
 ): ScopedCache<T, C> {
   let slot: CacheSlot<T> | null = null;
 
@@ -73,7 +76,9 @@ function createScopedCache<T, C>(
     async load({ client, scope, maxAgeMs = DEFAULT_MAX_AGE_MS }) {
       const key = cloudInventoryScopeKey(scope);
       const current = slot && slot.key === key ? slot : null;
-      if (current?.value && Date.now() - current.fetchedAt < maxAgeMs) return current.value;
+      const cached = current?.value;
+      const cacheable = cached != null && (options?.isFresh?.(cached) ?? true);
+      if (cacheable && current && Date.now() - current.fetchedAt < maxAgeMs) return cached;
       if (current?.inflight) return current.inflight;
 
       const inflight = fetcher({ client, scope });
@@ -94,6 +99,11 @@ function createScopedCache<T, C>(
         throw error;
       }
     },
+    seed(scope, value) {
+      const key = cloudInventoryScopeKey(scope);
+      if (slot && slot.key === key && slot.inflight) return;
+      slot = { key, value, fetchedAt: Date.now(), inflight: null };
+    },
     clear() {
       slot = null;
     },
@@ -102,6 +112,13 @@ function createScopedCache<T, C>(
 
 const connectCapabilitiesCache = createScopedCache<ConnectCapabilityInventory, ConnectCapabilityClient>(
   ({ client, scope }) => listAssignedConnectCapabilities({ client, organizationId: scope.organizationId }),
+  {
+    isFresh: (inventory) => (
+      inventory.plugins.length > 0
+      || inventory.skills.length > 0
+      || inventory.mcpServers.length > 0
+    ),
+  },
 );
 
 const orgMcpConnectionsCache = createScopedCache<DenExternalMcpConnection[], OrgMcpConnectionClient>(
@@ -134,14 +151,41 @@ export function loadOrgMcpConnections(input: {
   return orgMcpConnectionsCache.load(input);
 }
 
+export const CLOUD_INVENTORY_CHANGED_EVENT = "openwork-cloud-inventory-changed";
+
+function notifyCloudInventoryChanged() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event(CLOUD_INVENTORY_CHANGED_EVENT));
+  }
+}
+
 export function clearCloudInventoryCache() {
   connectCapabilitiesCache.clear();
   orgMcpConnectionsCache.clear();
+  notifyCloudInventoryChanged();
+}
+
+/**
+ * Stores an inventory the Activity sync just loaded, so the composer and
+ * Settings read it instead of fetching the same Den inventory again. When it
+ * changed, views listening for CLOUD_INVENTORY_CHANGED_EVENT re-read it.
+ */
+export function storeCloudInventory(
+  scope: CloudInventoryScope,
+  loaded: { capabilities: ConnectCapabilityInventory; connections: DenExternalMcpConnection[] },
+  options: { changed: boolean },
+) {
+  connectCapabilitiesCache.seed(scope, loaded.capabilities);
+  orgMcpConnectionsCache.seed(scope, loaded.connections);
+  if (options.changed) notifyCloudInventoryChanged();
 }
 
 function denClientForCurrentSession() {
   const settings = readDenSettings();
-  return createDenClient({ baseUrl: settings.baseUrl, token: settings.authToken?.trim() ?? "" });
+  return createDenClient({
+    baseUrl: settings.baseUrl,
+    token: settings.authToken?.trim() ?? "",
+  });
 }
 
 /**

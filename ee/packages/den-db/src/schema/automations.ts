@@ -2,11 +2,13 @@ import { relations, sql } from "drizzle-orm"
 import { bigint, index, int, json, mysqlEnum, mysqlTable, text, timestamp, uniqueIndex, varchar } from "drizzle-orm/mysql-core"
 import type {
   AutomationAction,
+  AutomationDesktopRunnerCapability,
   AutomationError,
   AutomationNeedsAttentionReason,
   AutomationRunEventType,
   AutomationSchedule,
   AutomationUsage,
+  DesktopRunnerInventory,
 } from "@openwork/types/automations"
 import { compatJsonColumn, denTypeIdColumn, encryptedColumn, encryptedMediumTextColumn, timestamps } from "../columns"
 
@@ -54,13 +56,15 @@ export const AutomationRevisionTable = mysqlTable(
     version: int("version").notNull(),
     instructions: encryptedMediumTextColumn("instructions").notNull(),
     schedule_kind: mysqlEnum("schedule_kind", ["once", "daily", "weekly"]).notNull(),
-    schedule_config: json("schedule_config").$type<AutomationSchedule>().notNull(),
+    schedule_config: compatJsonColumn<AutomationSchedule>("schedule_config").notNull(),
     timezone: varchar("timezone", { length: 120 }).notNull(),
     provider_id: varchar("provider_id", { length: 160 }).notNull(),
     model_id: varchar("model_id", { length: 240 }).notNull(),
     model_variant: varchar("model_variant", { length: 60 }),
     action: encryptedJsonColumn<AutomationAction>("action"),
     execution_target: mysqlEnum("execution_target", ["desktop", "cloud"]).notNull().default("desktop"),
+    /** Pinned target workspace; null keeps the legacy run-time active-workspace fallback. */
+    workspace_id: varchar("workspace_id", { length: 240 }),
     maximum_runtime_ms: int("maximum_runtime_ms").notNull(),
     digest: varchar("digest", { length: 128 }).notNull(),
     created_at: timestamp("created_at", { fsp: 3 }).notNull().default(sql`CURRENT_TIMESTAMP(3)`),
@@ -78,10 +82,14 @@ export const AutomationRunnerTable = mysqlTable(
     owner_member_id: denTypeIdColumn("member", "owner_member_id").notNull(),
     protocol_version: int("protocol_version").notNull(),
     supported_execution_targets: json("supported_execution_targets").$type<Array<"desktop">>().notNull(),
+    capabilities: json("capabilities").$type<AutomationDesktopRunnerCapability[]>(),
     app_version: varchar("app_version", { length: 80 }).notNull(),
     platform: mysqlEnum("platform", ["darwin", "win32", "linux"]).notNull(),
     concurrency: int("concurrency").notNull(),
     last_seen_at: timestamp("last_seen_at", { fsp: 3 }).notNull(),
+    /** Latest computer, workspace and model report; null until the desktop sends one. */
+    inventory: compatJsonColumn<DesktopRunnerInventory>("inventory"),
+    inventory_updated_at: timestamp("inventory_updated_at", { fsp: 3 }),
     ...timestamps,
   },
   (table) => [
@@ -117,7 +125,7 @@ export const AutomationRunTable = mysqlTable(
     finished_at: timestamp("finished_at", { fsp: 3 }),
     error: compatJsonColumn<AutomationError | null>("error"),
     result_summary: text("result_summary"),
-    codemode_receipt_id: denTypeIdColumn("codemodeRun", "codemode_receipt_id"),
+    codemode_receipt_id: denTypeIdColumn("workflowRun", "codemode_receipt_id"),
     validated_result: encryptedJsonColumn<unknown>("validated_result"),
     usage: compatJsonColumn<AutomationUsage>("usage").notNull(),
     cancel_requested_at: timestamp("cancel_requested_at", { fsp: 3 }),

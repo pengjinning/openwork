@@ -1,3 +1,5 @@
+import { denBrowserEndpoint } from "./den-api-origin";
+
 export type InstallPlatform = "mac-arm64" | "mac-x64" | "win-x64" | "linux-x64" | "linux-arm64";
 export type DetectedInstallerOs = "macos" | "windows" | "linux";
 export type DetectedInstallerArch = "arm64" | "x64";
@@ -31,6 +33,21 @@ export function buildInstallDownloadHref(apiUrl: string, platform: InstallPlatfo
   url.search = `?token=${encodeURIComponent(token)}`;
   url.hash = "";
   return url.toString();
+}
+
+export function buildAuthenticatedInstallDownloadHref(apiUrl: string, platform: InstallPlatform) {
+  const url = new URL(apiUrl);
+  const basePath = url.pathname.replace(/\/+$/, "");
+  url.pathname = `${basePath}/v1/me/install/${platform}`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+export function buildBrowserInstallDownloadHref(apiUrl: string, platform: InstallPlatform, token: string | null) {
+  return token
+    ? buildInstallDownloadHref(apiUrl, platform, token)
+    : denBrowserEndpoint(`/v1/me/install/${platform}`);
 }
 
 export function installTokenFromPageUrl(value: string) {

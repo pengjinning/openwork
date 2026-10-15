@@ -21,7 +21,18 @@ export type RuntimeNodeSqliteDatabase = {
 
 export type RuntimeSqliteDatabase = RuntimeBunSqliteDatabase | RuntimeNodeSqliteDatabase;
 
-export function runtimeDbPath(config: ServerConfig): string {
+/**
+ * Kept opaque so Bun's loader never eagerly pre-resolves the Node-only
+ * builtin (Bun lacks node:sqlite and its speculative resolution can surface
+ * as an unhandled rejection even though the guarded branch never runs).
+ */
+export const NODE_SQLITE_SPECIFIER = "node:sqlite";
+
+export function importNodeSqlite(): Promise<typeof import("node:sqlite")> {
+  return import(NODE_SQLITE_SPECIFIER);
+}
+
+export function runtimeDbPath(config: Pick<ServerConfig, "configPath">): string {
   const override = process.env.OPENWORK_RUNTIME_DB?.trim();
   if (override) return resolve(override);
   const configPath = config.configPath?.trim();
@@ -30,7 +41,7 @@ export function runtimeDbPath(config: ServerConfig): string {
 }
 
 /** Directory holding runtime state (the SQLite DB and derived files). */
-export function runtimeStorageDir(config: ServerConfig): string {
+export function runtimeStorageDir(config: Pick<ServerConfig, "configPath">): string {
   return dirname(runtimeDbPath(config));
 }
 
@@ -48,7 +59,7 @@ export async function openRuntimeSqliteDatabase(path: string): Promise<RuntimeSq
     };
   }
 
-  const { DatabaseSync } = await import("node:sqlite");
+  const { DatabaseSync } = await importNodeSqlite();
   const sqlite = new DatabaseSync(path);
   return {
     kind: "node",

@@ -3,6 +3,7 @@ import { WorkerTable, WorkerTokenTable } from "@openwork-ee/den-db/schema"
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
+import { attributeAuditRequest, auditServiceAttribution } from "../../audit/request-capture.js"
 import { db } from "../../db.js"
 import { jsonValidator, paramValidator, tokenRoute } from "../../middleware/index.js"
 import { invalidRequestSchema, jsonResponse, notFoundSchema, unauthorizedSchema } from "../../openapi.js"
@@ -30,6 +31,7 @@ export function registerWorkerActivityRoutes<T extends { Variables: WorkerRouteV
     "/v1/workers/:id/activity-heartbeat",
     describeRoute({
       tags: ["Workers", "Worker Activity"],
+      security: [{ workerHeartbeatToken: [] }],
       summary: "Record worker heartbeat",
       description: "Accepts signed heartbeat and recent-activity updates from a worker so Den can track worker health and recent usage.",
       responses: {
@@ -88,6 +90,12 @@ export function registerWorkerActivityRoutes<T extends { Variables: WorkerRouteV
     if (!worker) {
       return c.json({ error: "worker_not_found" }, 404)
     }
+    // Activity-scope token matched for this worker: its organization is the tenant.
+    const audited = await attributeAuditRequest(c, {
+      organizationId: worker.org_id,
+      ...auditServiceAttribution("worker", workerId, { credentialId: tokenRows[0] ? `worker_token:${tokenRows[0].id}` : null }),
+    })
+    if (!audited.ok) return audited.response
 
     const heartbeatAt = parseHeartbeatTimestamp(body.sentAt) ?? new Date()
     const requestedActivityAt = parseHeartbeatTimestamp(body.lastActivityAt ?? null)

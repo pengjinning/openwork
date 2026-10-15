@@ -1,6 +1,6 @@
 // Desktop workspace persistence and bootstrap configuration. This module owns
-// on-disk workspace state, per-workspace openwork.json files, remote workspace
-// normalization/discovery, and the workspace-facing command operations.
+// on-disk workspace state, per-workspace openwork.json files, and the
+// workspace-facing command operations.
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
@@ -9,10 +9,10 @@ import path from "node:path";
 import {
   desktopBootstrapPath as resolveDesktopBootstrapPath,
   legacyDesktopBootstrapPath as resolveLegacyDesktopBootstrapPath,
+  normalizeWorkspaceRootPath,
   openworkServerConfigPath as resolveOpenworkServerConfigPath,
 } from "@openwork/paths";
 
-import { openworkWorkspaceDisplayName, selectOpenworkWorkspaceForConnection } from "./remote-workspace.mjs";
 import { exportWorkspaceConfig, importWorkspaceConfig } from "./workspace-archive.mjs";
 
 const EMPTY_WORKSPACE_LIST = Object.freeze({
@@ -165,10 +165,14 @@ export function createWorkspaceStore({
   }
 
   function workspaceStatePath() {
+    const override = process.env.OPENWORK_DESKTOP_WORKSPACE_STATE_PATH?.trim();
+    if (override) return path.resolve(override);
     return path.join(app.getPath("userData"), "openwork-workspaces.json");
   }
 
   function openworkServerTokenStorePath() {
+    const override = process.env.OPENWORK_SERVER_TOKEN_STORE_PATH?.trim();
+    if (override) return path.resolve(override);
     return path.join(app.getPath("userData"), "openwork-server-tokens.json");
   }
 
@@ -525,25 +529,26 @@ export function createWorkspaceStore({
       : trimmed.startsWith("~/") || trimmed.startsWith("~\\")
         ? path.join(os.homedir(), trimmed.slice(2))
         : trimmed;
-    const resolved = path.resolve(expanded);
+    const normalized = normalizeWorkspaceRootPath(expanded, { platform: process.platform });
+    const resolved = path.resolve(normalized);
     return realpath(resolved).catch(() => resolved);
   }
 
   function normalizeWorkspacePathKey(value) {
-    const trimmed = String(value ?? "").trim();
-    return trimmed ? path.resolve(trimmed).replace(/\\/g, "/").toLowerCase() : "";
+    try {
+      const normalized = normalizeWorkspaceRootPath(value, { platform: process.platform });
+      return normalized ? path.resolve(normalized).replace(/\\/g, "/").toLowerCase() : "";
+    } catch {
+      return "";
+    }
   }
 
   function normalizeRecoveredWorkspacePath(value) {
-    const trimmed = String(value ?? "").trim();
-    if (!trimmed) return "";
-    if (process.platform !== "win32") return trimmed;
-    return trimmed
-      .replace(/^\\\\\?\\UNC\\/i, "\\\\")
-      .replace(/^\\\\\?\\/i, "")
-      .replace(/^\/\/\?\/UNC\//i, "//")
-      .replace(/^\/\/\?\//i, "")
-      .replace(/\//g, "\\");
+    try {
+      return normalizeWorkspaceRootPath(value, { platform: process.platform });
+    } catch {
+      return "";
+    }
   }
 
   function isRecord(value) {
@@ -610,25 +615,16 @@ export function createWorkspaceStore({
     const workspaces = [];
     for (const entry of config.workspaces) {
       if (!isRecord(entry)) continue;
-      const workspaceType = entry.workspaceType === "remote" ? "remote" : "local";
+      // Remote workspaces were removed; skip any an older build persisted.
+      if (isLegacyRemoteWorkspace(entry)) continue;
       const rawPath = typeof entry.path === "string" ? entry.path.trim() : "";
-      const normalizedPath = workspaceType === "local"
-        ? await normalizeLocalWorkspacePath(normalizeRecoveredWorkspacePath(rawPath))
-        : rawPath;
-      if (workspaceType === "local" && (!normalizedPath || !(await pathExists(normalizedPath)))) continue;
+      const normalizedPath = await normalizeLocalWorkspacePath(normalizeRecoveredWorkspacePath(rawPath));
+      if (!normalizedPath || !(await pathExists(normalizedPath))) continue;
 
-      const baseUrl = typeof entry.baseUrl === "string" ? entry.baseUrl.trim() : "";
-      const directory = typeof entry.directory === "string" && entry.directory.trim() ? entry.directory.trim() : null;
-      const remoteType = entry.remoteType === "opencode" ? "opencode" : "openwork";
-      const openworkWorkspaceId = typeof entry.openworkWorkspaceId === "string" ? entry.openworkWorkspaceId.trim() : "";
       const id = typeof entry.id === "string" && entry.id.trim()
         ? entry.id.trim()
-        : workspaceType === "remote"
-          ? remoteType === "openwork"
-            ? openworkRemoteWorkspaceId(baseUrl, openworkWorkspaceId)
-            : remoteWorkspaceId(baseUrl, directory)
-          : localWorkspaceId(normalizedPath);
-      const key = workspaceType === "remote" ? id : normalizeWorkspacePathKey(normalizedPath);
+        : localWorkspaceId(normalizedPath);
+      const key = normalizeWorkspacePathKey(normalizedPath);
       if (!key || seen.has(key)) continue;
       seen.add(key);
       workspaces.push(normalizeWorkspaceEntry({
@@ -640,8 +636,7 @@ export function createWorkspaceStore({
           : path.basename(normalizedPath) || "Workspace",
         displayName: typeof entry.displayName === "string" ? entry.displayName : undefined,
         preset: typeof entry.preset === "string" && entry.preset.trim() ? entry.preset.trim() : "starter",
-        workspaceType,
-        ...(workspaceType === "remote" ? { remoteType, baseUrl, directory } : {}),
+        workspaceType: "local",
       }));
     }
     return workspaces;
@@ -661,92 +656,8 @@ export function createWorkspaceStore({
     return stableWorkspaceId(workspacePath);
   }
 
-  function remoteWorkspaceId(baseUrl, directory) {
-    const key = String(directory ?? "").trim()
-      ? `remote::${baseUrl}::${String(directory).trim()}`
-      : `remote::${baseUrl}`;
-    return stableWorkspaceId(key);
-  }
-
-  function parseOpenworkWorkspaceIdFromUrl(input) {
-    const raw = String(input ?? "").trim();
-    if (!raw) return null;
-    try {
-      const url = new URL(raw);
-      const segments = url.pathname.split("/").filter(Boolean);
-      const workspaceIndex = segments.indexOf("workspace");
-      const legacyIndex = segments.indexOf("w");
-      const mountIndex = workspaceIndex >= 0 ? workspaceIndex : legacyIndex;
-      return mountIndex >= 0 && segments[mountIndex + 1]
-        ? decodeURIComponent(segments[mountIndex + 1])
-        : null;
-    } catch {
-      const match = raw.match(/\/(?:workspace|w)\/([^/?#]+)/);
-      if (!match?.[1]) return null;
-      try {
-        return decodeURIComponent(match[1]);
-      } catch {
-        return match[1];
-      }
-    }
-  }
-
-  function stripOpenworkWorkspaceMount(input) {
-    const raw = String(input ?? "").trim();
-    if (!raw) return null;
-    try {
-      const url = new URL(raw);
-      const segments = url.pathname.split("/").filter(Boolean);
-      const workspaceIndex = segments.indexOf("workspace");
-      const legacyIndex = segments.indexOf("w");
-      const mountIndex = workspaceIndex >= 0 ? workspaceIndex : legacyIndex;
-      if (mountIndex >= 0 && segments[mountIndex + 1]) {
-        const prefix = segments.slice(0, mountIndex).join("/");
-        url.pathname = prefix ? `/${prefix}` : "/";
-      }
-      return url.toString().replace(/\/+$/, "");
-    } catch {
-      return raw.replace(/\/(?:workspace|w)\/[^/?#]+.*$/, "").replace(/\/+$/, "") || raw;
-    }
-  }
-
-  function openworkRemoteWorkspaceId(hostUrl, workspaceId) {
-    const remoteWorkspaceId = String(workspaceId ?? "").trim() || parseOpenworkWorkspaceIdFromUrl(hostUrl);
-    if (remoteWorkspaceId) return `rem_${remoteWorkspaceId}`;
-    return `rem_${createHash("sha256").update(`openwork::${hostUrl}`).digest("hex").slice(0, 12)}`;
-  }
-
-  async function fetchOpenworkWorkspaceList(hostUrl, token, hostToken) {
-    const url = `${String(hostUrl ?? "").replace(/\/+$/, "")}/workspaces`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8_000);
-    const headers = new Headers();
-    const bearerToken = String(token ?? "").trim();
-    const hostAuthToken = String(hostToken ?? "").trim();
-    if (bearerToken) headers.set("Authorization", `Bearer ${bearerToken}`);
-    if (hostAuthToken) headers.set("X-OpenWork-Host-Token", hostAuthToken);
-
-    try {
-      const electron = await import("electron").catch(() => null);
-      const fetcher = typeof electron?.net?.fetch === "function" ? electron.net.fetch.bind(electron.net) : fetch;
-      const response = await fetcher(url, {
-        headers,
-        signal: controller.signal,
-        credentials: "omit",
-        cache: "no-store",
-      });
-      if (!response.ok) {
-        throw new Error(`OpenWork workspace discovery failed (${response.status} ${response.statusText || "HTTP error"})`);
-      }
-      return await response.json();
-    } finally {
-      clearTimeout(timeout);
-    }
-  }
-
-  async function discoverOpenworkWorkspace({ hostUrl, token, hostToken, directory }) {
-    const list = await fetchOpenworkWorkspaceList(hostUrl, token, hostToken);
-    return selectOpenworkWorkspaceForConnection(list, directory);
+  function isLegacyRemoteWorkspace(entry) {
+    return isRecord(entry) && entry.workspaceType === "remote";
   }
 
   function normalizeWorkspaceEntry(input) {
@@ -755,17 +666,10 @@ export function createWorkspaceStore({
       name: String(input.name ?? "Workspace"),
       path: String(input.path ?? ""),
       preset: String(input.preset ?? "starter"),
-      workspaceType: input.workspaceType === "remote" ? "remote" : "local",
-      remoteType: input.remoteType ?? null,
+      workspaceType: "local",
       baseUrl: input.baseUrl ?? null,
       directory: input.directory ?? null,
       displayName: input.displayName ?? null,
-      openworkHostUrl: input.openworkHostUrl ?? null,
-      openworkToken: input.openworkToken ?? null,
-      openworkClientToken: input.openworkClientToken ?? null,
-      openworkHostToken: input.openworkHostToken ?? null,
-      openworkWorkspaceId: input.openworkWorkspaceId ?? null,
-      openworkWorkspaceName: input.openworkWorkspaceName ?? null,
       sandboxBackend: input.sandboxBackend ?? null,
       sandboxRunId: input.sandboxRunId ?? null,
       sandboxContainerName: input.sandboxContainerName ?? null,
@@ -842,64 +746,27 @@ export function createWorkspaceStore({
         changed = true;
       }
     }
-    const idMap = new Map();
-    const migratedWorkspaces = workspaces.map((entry) => {
-      const workspace = entry && typeof entry === "object" ? entry : normalizeWorkspaceEntry(entry ?? {});
-      if (workspace.workspaceType !== "remote" || workspace.remoteType !== "openwork") return workspace;
-
-      const remoteWorkspaceId = String(workspace.openworkWorkspaceId ?? "").trim()
-        || parseOpenworkWorkspaceIdFromUrl(workspace.openworkHostUrl)
-        || parseOpenworkWorkspaceIdFromUrl(workspace.baseUrl);
-      if (!remoteWorkspaceId) return workspace;
-
-      const hostUrl = stripOpenworkWorkspaceMount(workspace.openworkHostUrl) || stripOpenworkWorkspaceMount(workspace.baseUrl);
-      const nextId = openworkRemoteWorkspaceId(hostUrl ?? workspace.baseUrl, remoteWorkspaceId);
-      idMap.set(workspace.id, nextId);
-      const nextWorkspace = {
-        ...workspace,
-        id: nextId,
-        baseUrl: hostUrl,
-        openworkWorkspaceId: remoteWorkspaceId,
-        openworkHostUrl: hostUrl,
-      };
-      if (workspace.id !== nextWorkspace.id || workspace.baseUrl !== nextWorkspace.baseUrl || workspace.openworkWorkspaceId !== nextWorkspace.openworkWorkspaceId || workspace.openworkHostUrl !== nextWorkspace.openworkHostUrl) {
-        changed = true;
-      }
-      return nextWorkspace;
+    // Remote workspaces were removed. Drop entries persisted by older builds
+    // and move any selection that pointed at one to a remaining workspace.
+    const droppedIds = new Set();
+    const localWorkspaces = workspaces.filter((entry) => {
+      if (!isLegacyRemoteWorkspace(entry)) return true;
+      droppedIds.add(String(entry.id ?? ""));
+      return false;
     });
-    // Older desktop state can contain multiple OpenWork remote entries that
-    // normalize to the same rem_<workspaceId> after stripping worker mounts.
-    // Collapse them here so React never receives duplicate workspace keys.
-    const workspaceIndexById = new Map();
-    const dedupedWorkspaces = [];
-    for (const workspace of migratedWorkspaces) {
-      const workspaceId = String(workspace?.id ?? "").trim();
-      if (!workspaceId) {
-        dedupedWorkspaces.push(workspace);
-        continue;
-      }
-      const existingIndex = workspaceIndexById.get(workspaceId);
-      if (existingIndex === undefined) {
-        workspaceIndexById.set(workspaceId, dedupedWorkspaces.length);
-        dedupedWorkspaces.push(workspace);
-        continue;
-      }
-      // Keep the later entry: normal mutations replace-then-push refreshed
-      // remote workspaces, and there is no persisted updatedAt to compare.
-      dedupedWorkspaces[existingIndex] = workspace;
+    if (droppedIds.size > 0) {
       changed = true;
+      const fallbackId = String(localWorkspaces[0]?.id ?? "");
+      if (droppedIds.has(selectedId)) selectedId = fallbackId;
+      if (watchedId && droppedIds.has(watchedId)) watchedId = null;
+      if (activeId && droppedIds.has(activeId)) activeId = fallbackId || null;
     }
 
-    const migratedSelectedId = idMap.get(selectedId) ?? selectedId;
-    const migratedWatchedId = watchedId ? idMap.get(watchedId) ?? watchedId : null;
-    const migratedActiveId = activeId ? idMap.get(activeId) ?? activeId : null;
-    if (migratedSelectedId !== selectedId || migratedWatchedId !== watchedId || migratedActiveId !== activeId) changed = true;
-
     const nextState = {
-      selectedId: migratedSelectedId,
-      watchedId: migratedWatchedId,
-      activeId: migratedActiveId,
-      workspaces: dedupedWorkspaces,
+      selectedId,
+      watchedId,
+      activeId,
+      workspaces: localWorkspaces,
     };
 
     if (changed) {
@@ -914,10 +781,32 @@ export function createWorkspaceStore({
     return writeWorkspaceState(next);
   }
 
+  async function bootstrapFirstLaunchWorkspace() {
+    const state = await readWorkspaceState();
+    // Recovery and an explicitly saved empty list both take precedence.
+    if (state.workspaces.length > 0 || existsSync(workspaceStatePath())) return null;
+    const home = process.env.OPENWORK_DEV_MODE === "1" && process.env.OPENWORK_DEV_SHARED_STATE !== "1"
+      ? path.join(app.getPath("userData"), "openwork-dev-data", "home")
+      : os.homedir();
+    const folderPath = await normalizeLocalWorkspacePath(path.join(home, "OpenWork Chat"));
+    try {
+      await createWorkspace({ folderPath });
+      return null;
+    } catch (error) {
+      // A blocked default folder is recoverable by choosing another folder.
+      // Never hide registry writes or unexpected initialization failures.
+      if (
+        !["EEXIST", "ENOTDIR", "EACCES", "EPERM", "EROFS"].includes(error?.code)
+        || typeof error.path !== "string"
+        || (error.path !== folderPath && !error.path.startsWith(`${folderPath}${path.sep}`))
+      ) throw error;
+      return { folderPath, error: error.message };
+    }
+  }
+
   async function listLocalWorkspacePaths() {
     return (await readWorkspaceState())
       .workspaces
-      .filter((entry) => entry?.workspaceType !== "remote")
       .map((entry) => String(entry?.path ?? "").trim())
       .filter(Boolean);
   }
@@ -956,7 +845,9 @@ export function createWorkspaceStore({
       workspaceType: "local",
     });
     await mkdir(path.join(folderPath, ".opencode"), { recursive: true });
-    await writeWorkspaceOpenworkConfig(folderPath, defaultWorkspaceOpenworkConfig(folderPath, preset));
+    if (!(await pathExists(path.join(folderPath, ".opencode", "openwork.json")))) {
+      await writeWorkspaceOpenworkConfig(folderPath, defaultWorkspaceOpenworkConfig(folderPath, preset));
+    }
 
     return mutateWorkspaceState((state) => {
       const key = workspacePathKey(workspace);
@@ -967,144 +858,6 @@ export function createWorkspaceStore({
       state.selectedId = workspace.id;
       state.activeId = workspace.id;
       state.watchedId = workspace.id;
-      return state;
-    });
-  }
-
-  async function createRemoteWorkspace(input = {}) {
-    const baseUrl = String(input.baseUrl ?? "").trim();
-    if (!baseUrl) throw new Error("baseUrl is required");
-    if (!baseUrl.startsWith("http://") && !baseUrl.startsWith("https://")) {
-      throw new Error("baseUrl must start with http:// or https://");
-    }
-    const remoteType = input.remoteType === "opencode" ? "opencode" : "openwork";
-    const directory = typeof input.directory === "string" && input.directory.trim() ? input.directory.trim() : null;
-    const rawOpenworkHostUrl = typeof input.openworkHostUrl === "string" && input.openworkHostUrl.trim()
-      ? input.openworkHostUrl.trim()
-      : null;
-    const openworkHostUrl = remoteType === "openwork"
-      ? stripOpenworkWorkspaceMount(rawOpenworkHostUrl ?? baseUrl)
-      : rawOpenworkHostUrl;
-    const openworkWorkspaceId = typeof input.openworkWorkspaceId === "string" && input.openworkWorkspaceId.trim()
-      ? input.openworkWorkspaceId.trim()
-      : remoteType === "openwork"
-        ? parseOpenworkWorkspaceIdFromUrl(rawOpenworkHostUrl) || parseOpenworkWorkspaceIdFromUrl(baseUrl)
-        : null;
-    let resolvedOpenworkWorkspaceId = openworkWorkspaceId;
-    let resolvedOpenworkWorkspaceName = input.openworkWorkspaceName ?? null;
-    if (remoteType === "openwork" && !resolvedOpenworkWorkspaceId) {
-      const discovered = await discoverOpenworkWorkspace({
-        hostUrl: openworkHostUrl ?? baseUrl,
-        token: input.openworkToken,
-        hostToken: input.openworkHostToken,
-        directory,
-      });
-      if (!discovered?.id) {
-        throw new Error(
-          directory
-            ? `OpenWork server has no workspace matching ${directory}.`
-            : "OpenWork server returned no workspaces.",
-        );
-      }
-      resolvedOpenworkWorkspaceId = String(discovered.id).trim();
-      resolvedOpenworkWorkspaceName = openworkWorkspaceDisplayName(discovered);
-    }
-    const id = remoteType === "openwork"
-      ? openworkRemoteWorkspaceId(openworkHostUrl ?? baseUrl, resolvedOpenworkWorkspaceId)
-      : remoteWorkspaceId(baseUrl, directory);
-    const workspace = normalizeWorkspaceEntry({
-      id,
-      name: String(input.displayName ?? resolvedOpenworkWorkspaceName ?? "Remote workspace"),
-      displayName: input.displayName ?? null,
-      path: directory ?? "",
-      preset: "remote",
-      workspaceType: "remote",
-      remoteType,
-      baseUrl: remoteType === "openwork" ? (openworkHostUrl ?? baseUrl) : baseUrl,
-      directory,
-      openworkHostUrl,
-      openworkToken: input.openworkToken ?? null,
-      openworkClientToken: input.openworkClientToken ?? null,
-      openworkHostToken: input.openworkHostToken ?? null,
-      openworkWorkspaceId: resolvedOpenworkWorkspaceId,
-      openworkWorkspaceName: resolvedOpenworkWorkspaceName,
-      sandboxBackend: input.sandboxBackend ?? null,
-      sandboxRunId: input.sandboxRunId ?? null,
-      sandboxContainerName: input.sandboxContainerName ?? null,
-    });
-    return mutateWorkspaceState((state) => {
-      state.workspaces = state.workspaces.filter((entry) => entry.id !== workspace.id);
-      state.workspaces.push(workspace);
-      state.selectedId = workspace.id;
-      state.activeId = workspace.id;
-      return state;
-    });
-  }
-
-  async function updateRemoteWorkspace(input = {}) {
-    const workspaceId = String(input.workspaceId ?? "").trim();
-    if (!workspaceId) throw new Error("workspaceId is required");
-    const { workspaceId: _workspaceId, ...patch } = input;
-    return mutateWorkspaceState(async (state) => {
-      const existing = state.workspaces.find((entry) => entry.id === workspaceId);
-      if (!existing) return state;
-
-      let nextWorkspace = { ...existing, ...patch };
-      const nextRemoteType = nextWorkspace.remoteType === "opencode" ? "opencode" : "openwork";
-      if (nextRemoteType === "openwork") {
-        const rawHostUrl = typeof nextWorkspace.openworkHostUrl === "string" && nextWorkspace.openworkHostUrl.trim()
-          ? nextWorkspace.openworkHostUrl.trim()
-          : null;
-        const nextBaseUrl = String(nextWorkspace.baseUrl ?? "").trim();
-        const hostUrl = stripOpenworkWorkspaceMount(rawHostUrl ?? nextBaseUrl);
-        const directory = typeof nextWorkspace.directory === "string" && nextWorkspace.directory.trim()
-          ? nextWorkspace.directory.trim()
-          : null;
-        const parsedWorkspaceId = parseOpenworkWorkspaceIdFromUrl(rawHostUrl) || parseOpenworkWorkspaceIdFromUrl(nextBaseUrl);
-        let remoteWorkspaceId = parsedWorkspaceId || (
-          typeof nextWorkspace.openworkWorkspaceId === "string" && nextWorkspace.openworkWorkspaceId.trim()
-            ? nextWorkspace.openworkWorkspaceId.trim()
-            : null
-        );
-        let remoteWorkspaceName = nextWorkspace.openworkWorkspaceName ?? null;
-        if (!remoteWorkspaceId) {
-          const discovered = await discoverOpenworkWorkspace({
-            hostUrl: hostUrl ?? nextBaseUrl,
-            token: nextWorkspace.openworkToken,
-            hostToken: nextWorkspace.openworkHostToken,
-            directory,
-          });
-          if (!discovered?.id) {
-            throw new Error(
-              directory
-                ? `OpenWork server has no workspace matching ${directory}.`
-                : "OpenWork server returned no workspaces.",
-            );
-          }
-          remoteWorkspaceId = String(discovered.id).trim();
-          remoteWorkspaceName = openworkWorkspaceDisplayName(discovered);
-        }
-        const nextId = openworkRemoteWorkspaceId(hostUrl ?? nextBaseUrl, remoteWorkspaceId);
-        nextWorkspace = normalizeWorkspaceEntry({
-          ...nextWorkspace,
-          id: nextId,
-          baseUrl: hostUrl ?? nextBaseUrl,
-          openworkHostUrl: hostUrl,
-          directory,
-          remoteType: "openwork",
-          openworkWorkspaceId: remoteWorkspaceId,
-          openworkWorkspaceName: remoteWorkspaceName,
-        });
-        if (nextId !== workspaceId) {
-          if (state.selectedId === workspaceId) state.selectedId = nextId;
-          if (state.activeId === workspaceId) state.activeId = nextId;
-          if (state.watchedId === workspaceId) state.watchedId = nextId;
-        }
-      }
-
-      state.workspaces = state.workspaces.map((entry) =>
-        entry.id === workspaceId ? nextWorkspace : entry,
-      );
       return state;
     });
   }
@@ -1125,7 +878,7 @@ export function createWorkspaceStore({
     let workspacePath = "";
     const nextState = await mutateWorkspaceState((state) => {
       const workspace = state.workspaces.find((entry) => entry.id === workspaceId);
-      if (workspace?.workspaceType !== "remote") workspacePath = String(workspace?.path ?? "");
+      workspacePath = String(workspace?.path ?? "");
       state.workspaces = state.workspaces.filter((entry) => entry.id !== workspaceId);
       if (state.selectedId === workspaceId) state.selectedId = "";
       if (state.activeId === workspaceId) state.activeId = null;
@@ -1203,7 +956,7 @@ export function createWorkspaceStore({
 
   return {
     addAuthorizedRoot,
-    createRemoteWorkspace,
+    bootstrapFirstLaunchWorkspace,
     createWorkspace,
     clearDesktopBootstrapConfig,
     debugDesktopBootstrapConfig,
@@ -1221,7 +974,6 @@ export function createWorkspaceStore({
     setDesktopBootstrapConfig,
     setRuntimeActiveWorkspace,
     setSelectedWorkspace,
-    updateRemoteWorkspace,
     updateWorkspaceDisplayName,
     writeWorkspaceOpenworkConfig,
     writeWorkspaceState,

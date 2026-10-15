@@ -4,7 +4,6 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, ExternalLink } from "lucide-react";
-import { getDesktopGrant } from "../_lib/desktop-handoff";
 import { getErrorMessage, requestJson } from "../_lib/den-flow";
 import {
   PENDING_WORKSPACE_CLAIM_STORAGE_KEY,
@@ -69,6 +68,16 @@ function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
+// Teammates saved with the workspace come back on accept, so invites survive a
+// sign-up or verification round trip that drops the `invite` URL parameter.
+function teammatesToInvite(fromUrl: readonly string[], payload: unknown): string[] {
+  const saved =
+    typeof payload === "object" && payload !== null && Array.isArray((payload as { teammateEmails?: unknown }).teammateEmails)
+      ? (payload as { teammateEmails: unknown[] }).teammateEmails.filter((email): email is string => typeof email === "string")
+      : [];
+  return [...new Set([...fromUrl, ...saved].map((email) => email.trim().toLowerCase()).filter(Boolean))].slice(0, 10);
+}
+
 async function inviteTeammates(inviteEmails: readonly string[]): Promise<string> {
   const results = await Promise.allSettled(
     inviteEmails.map((email) =>
@@ -104,7 +113,7 @@ export function WorkspaceClaimScreen({
   const [claimedOrg, setClaimedOrg] = useState<AcceptedClaim | null>(null);
   const [handoffBusy, setHandoffBusy] = useState(false);
   const [copyBusy, setCopyBusy] = useState(false);
-  const [codeCopied, setCodeCopied] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
   const [handoffError, setHandoffError] = useState<string | null>(null);
   const [handoffAttempted, setHandoffAttempted] = useState(false);
   const [inviteSummary, setInviteSummary] = useState<string | null>(null);
@@ -164,14 +173,15 @@ export function WorkspaceClaimScreen({
         window.sessionStorage.removeItem(PENDING_WORKSPACE_CLAIM_STORAGE_KEY);
       }
 
-      if (inviteEmails.length > 0) {
+      const toInvite = teammatesToInvite(inviteEmails, payload);
+      if (toInvite.length > 0) {
         // The claim above just made this account the owner (and set it as
         // the session's active organization), so it can now invite
         // teammates through the same endpoint Manage Members uses. Show the
         // result briefly before moving on - this is best-effort: a failed
         // invite never blocks the claim, the owner can always retry from
         // Manage Members.
-        const summary = await inviteTeammates(inviteEmails);
+        const summary = await inviteTeammates(toInvite);
         setInviteSummary(summary);
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 1400));
       }
@@ -209,12 +219,12 @@ export function WorkspaceClaimScreen({
     );
 
     if (!response.ok) {
-      throw new Error(getErrorMessage(payload, `Could not prepare a desktop sign-in link (${response.status}).`));
+      throw new Error(getErrorMessage(payload, `Could not prepare an OpenWork link (${response.status}).`));
     }
 
     const openworkUrl = getOpenworkUrl(payload);
     if (!openworkUrl) {
-      throw new Error("Desktop sign-in succeeded, but no app link was returned.");
+      throw new Error("No OpenWork link was returned.");
     }
 
     return openworkUrl;
@@ -234,9 +244,9 @@ export function WorkspaceClaimScreen({
     }
   }
 
-  async function handleCopySignInCode() {
+  async function handleCopyOpenWorkLink() {
     setCopyBusy(true);
-    setCodeCopied(false);
+    setLinkCopied(false);
     setHandoffError(null);
 
     try {
@@ -244,16 +254,12 @@ export function WorkspaceClaimScreen({
         throw new Error("Clipboard is not available in this browser.");
       }
 
-      const grant = getDesktopGrant(await createDesktopHandoff());
-      if (!grant) {
-        throw new Error("Desktop sign-in succeeded, but no one-time code was returned.");
-      }
-
-      await navigator.clipboard.writeText(grant);
-      setCodeCopied(true);
-      window.setTimeout(() => setCodeCopied(false), 1800);
+      const openworkUrl = await createDesktopHandoff();
+      await navigator.clipboard.writeText(openworkUrl);
+      setLinkCopied(true);
+      window.setTimeout(() => setLinkCopied(false), 1800);
     } catch (error) {
-      setHandoffError(error instanceof Error ? error.message : "Could not copy the sign-in code.");
+      setHandoffError(error instanceof Error ? error.message : "Could not copy the OpenWork link.");
     } finally {
       setCopyBusy(false);
     }
@@ -339,56 +345,31 @@ export function WorkspaceClaimScreen({
             <p className={`den-eyebrow ${isLoopback ? "text-blue-700" : ""}`}>{isLoopback ? "Demo workspace ready" : "Workspace ready"}</p>
             <h1 className="den-title-lg max-w-[22ch]">{claimedOrg.organizationName} is yours.</h1>
             <p className="den-copy max-w-[46ch]">
-              {isLoopback
-                ? "Copy the one-time code, then paste it into OpenWork to finish signing in."
-                : "Open the desktop app to finish signing in. You will not need to enter your password again."}
+              Copy the OpenWork link, open OpenWork, and paste it under Paste sign-in code. You will not need to enter your password again.
             </p>
           </div>
 
           <div className="grid gap-3">
-            {isLoopback ? (
+            <button
+              type="button"
+              className={`den-button-primary w-full sm:w-auto ${isLoopback ? "bg-blue-600 shadow-[0_16px_34px_-18px_rgba(37,99,235,0.75)] hover:!bg-blue-700" : ""}`}
+              onClick={() => void handleCopyOpenWorkLink()}
+              disabled={handoffBusy || copyBusy}
+            >
+              <Copy className="size-4" aria-hidden />
+              {copyBusy ? "Copying..." : linkCopied ? "Link copied" : "Copy OpenWork link"}
+            </button>
+
+            <div className="flex flex-col items-center justify-center gap-2 text-sm sm:flex-row sm:gap-5">
               <button
                 type="button"
-                className="den-button-primary w-full bg-blue-600 shadow-[0_16px_34px_-18px_rgba(37,99,235,0.75)] hover:!bg-blue-700"
-                onClick={() => void handleCopySignInCode()}
-                disabled={handoffBusy || copyBusy}
-              >
-                <Copy className="size-4" aria-hidden />
-                {copyBusy ? "Copying..." : codeCopied ? "Code copied" : "Copy sign-in code"}
-              </button>
-            ) : (
-              <button
-                type="button"
-                className="den-button-primary w-full sm:w-auto"
+                className={`inline-flex min-h-10 items-center gap-1.5 px-2 font-medium transition disabled:opacity-60 ${isLoopback ? "text-[var(--dls-text-primary)] hover:text-blue-700" : "text-[var(--dls-text-secondary)] hover:text-[var(--dls-text-primary)]"}`}
                 onClick={() => void handleOpenDesktop()}
                 disabled={handoffBusy || copyBusy}
               >
+                <ExternalLink className="size-3.5" aria-hidden />
                 {handoffBusy ? "Opening OpenWork..." : "Open OpenWork"}
               </button>
-            )}
-
-            <div className="flex flex-col items-center justify-center gap-2 text-sm sm:flex-row sm:gap-5">
-              {isLoopback ? (
-                <button
-                  type="button"
-                  className="inline-flex min-h-10 items-center gap-1.5 px-2 font-medium text-[var(--dls-text-primary)] transition hover:text-blue-700 disabled:opacity-60"
-                  onClick={() => void handleOpenDesktop()}
-                  disabled={handoffBusy || copyBusy}
-                >
-                  <ExternalLink className="size-3.5" aria-hidden />
-                  {handoffBusy ? "Opening OpenWork..." : "Open OpenWork"}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  className="inline-flex min-h-10 items-center gap-1.5 px-2 font-medium text-[var(--dls-text-secondary)] transition hover:text-[var(--dls-text-primary)] disabled:opacity-60"
-                  onClick={() => void handleCopySignInCode()}
-                  disabled={handoffBusy || copyBusy}
-                >
-                  <Copy className="size-3.5" aria-hidden />
-                  {copyBusy ? "Copying..." : codeCopied ? "Code copied" : "Copy sign-in code"}
-                </button>
-              )}
               <span className="hidden text-[var(--dls-border)] sm:inline" aria-hidden>•</span>
               <button
                 type="button"
@@ -401,9 +382,9 @@ export function WorkspaceClaimScreen({
             </div>
           </div>
 
-          {codeCopied ? (
+          {linkCopied ? (
             <div className="rounded-2xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm font-medium text-blue-800">
-              In OpenWork, choose &quot;Paste sign-in code&quot; and paste it once.
+              Open OpenWork and paste the OpenWork link under Paste sign-in code.
             </div>
           ) : null}
 

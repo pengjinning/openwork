@@ -7,9 +7,10 @@ import {
   TeamMemberTable,
 } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
-import { AUTOMATION_FREE_MODEL } from "@openwork/types/automations"
+import { AUTOMATION_CLOUD_DEFAULT_MODEL, AUTOMATION_FREE_MODEL, automationModelAllowedByProvider } from "@openwork/types/automations"
 import { INFERENCE_MODEL_ALIASES } from "@openwork/types/den/inference"
 import { db } from "../db.js"
+import { organizationAllowsManagedModels } from "../inference.js"
 import { calculateDesktopPolicyForOrgMember } from "../desktop-policies.js"
 
 type ProviderId = typeof LlmProviderTable.$inferSelect.id
@@ -23,6 +24,7 @@ export type AutomationAuthorityProvider = {
   id: ProviderId
   source: "models_dev" | "custom" | "openwork"
   name: string
+  providerConfig: Record<string, unknown>
 }
 
 export type AutomationAuthorityModel = {
@@ -36,7 +38,7 @@ export type AutomationModelSelection = {
 }
 
 export type ResolvedAutomationModel = AutomationModelSelection & {
-  accessKind: "free" | "openwork_managed" | "authorized_custom"
+  accessKind: "free" | "openwork_managed" | "authorized_custom" | "cloud_default"
   providerRecordId: string | null
   providerName: string
   modelName: string
@@ -46,6 +48,8 @@ export type AutomationAuthorityFailure = {
   ok: false
   code: "owner_membership_lost" | "model_access_lost" | "provider_unavailable"
   message: string
+  /** Internal rollout classification; never substitutes for checking existing grants. */
+  reason?: "provider_model_disabled"
 }
 
 export type AutomationAuthorityResult =
@@ -72,6 +76,7 @@ const databaseAuthorityStore: AutomationModelAuthorityStore = {
   },
 
   async findOpenWorkProvider(input) {
+    if (!await organizationAllowsManagedModels(normalizeDenTypeId("organization", input.organizationId))) return null
     const providers = await db.select().from(LlmProviderTable).where(and(
       eq(LlmProviderTable.organizationId, normalizeDenTypeId("organization", input.organizationId)),
       eq(LlmProviderTable.createdByOrgMembershipId, normalizeDenTypeId("member", input.ownerMemberId)),
@@ -159,6 +164,25 @@ export async function resolveAutomationModelAccessWithStore(
     return { ok: false, code: "owner_membership_lost", message: "The Automation owner is no longer an active organization member." }
   }
 
+  if (input.providerId === AUTOMATION_CLOUD_DEFAULT_MODEL.providerId) {
+    // Placement (cloud, headless runtime) is enforced where the Automation is
+    // created or changed; here an active owner is all the cloud default needs.
+    if (input.modelId !== AUTOMATION_CLOUD_DEFAULT_MODEL.modelId) {
+      return { ok: false, code: "model_access_lost", message: "The selected cloud model is not available for Automations." }
+    }
+    return {
+      ok: true,
+      value: {
+        accessKind: "cloud_default",
+        providerRecordId: null,
+        providerId: input.providerId,
+        modelId: input.modelId,
+        providerName: AUTOMATION_CLOUD_DEFAULT_MODEL.providerName,
+        modelName: AUTOMATION_CLOUD_DEFAULT_MODEL.modelName,
+      },
+    }
+  }
+
   if (input.providerId === AUTOMATION_FREE_MODEL.providerId) {
     if (input.modelId !== AUTOMATION_FREE_MODEL.modelId) {
       return { ok: false, code: "model_access_lost", message: "The selected free model is not available for Automations." }
@@ -195,6 +219,9 @@ export async function resolveAutomationModelAccessWithStore(
     if (!await store.canAccessProvider({ member, providerRecordId: provider.id })) {
       return { ok: false, code: "model_access_lost", message: "The Automation owner no longer has access to OpenWork Models." }
     }
+    if (!automationModelAllowedByProvider(provider.providerConfig, input.modelId)) {
+      return { ok: false, code: "model_access_lost", reason: "provider_model_disabled", message: "The selected model is disabled by its provider configuration." }
+    }
     return {
       ok: true,
       value: {
@@ -218,6 +245,9 @@ export async function resolveAutomationModelAccessWithStore(
   }
   if (!await store.canAccessProvider({ member, providerRecordId: provider.id })) {
     return { ok: false, code: "model_access_lost", message: "The Automation owner no longer has access to the selected model." }
+  }
+  if (!automationModelAllowedByProvider(provider.providerConfig, input.modelId)) {
+    return { ok: false, code: "model_access_lost", reason: "provider_model_disabled", message: "The selected model is disabled by its provider configuration." }
   }
   return { ok: true, value: resolvedProviderModel({ accessKind: "authorized_custom", providerId: input.providerId, modelId: input.modelId, provider, model }) }
 }

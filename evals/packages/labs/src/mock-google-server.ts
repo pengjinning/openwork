@@ -4,12 +4,41 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
 import { buildOidcClaims, signOidcJwt } from "./idp.ts";
+import { mockDrive, type MockDriveFileSeed } from "./mock-google-drive.ts";
+import { serviceActionsWitness } from "./mock-service-actions.ts";
 
 interface MockGoogleServerOptions {
   accounts: string[];
   port: number;
   autoApprove: boolean;
   baseUrl?: string;
+  threads?: Record<string, MockGoogleThread[]>;
+  /** Access-token lifetime returned by /token; below Den's 60 s safety window forces a refresh on every call. */
+  accessTokenTtlSeconds?: number;
+  driveFiles?: Record<string, MockDriveFileSeed[]>;
+  tokenScopes?: MockTokenScopes;
+}
+
+/**
+ * How the token endpoint reports granted scopes. "echo" returns the requested
+ * list verbatim. "entra" matches Microsoft Entra ID v2.0: offline_access is
+ * honored (a refresh token is issued) but never listed in the response scope.
+ */
+export type MockTokenScopes = "echo" | "entra" | { mode: "entra"; withhold: string[] };
+
+function reportedScope(mode: MockTokenScopes, scope: string): string {
+  if (mode === "echo") return scope;
+  // `withhold` models a permission the tenant never consented to: Entra issues
+  // the token without it instead of failing the sign-in.
+  const omitted = new Set(["offline_access", ...(typeof mode === "object" ? mode.withhold : [])].map((entry) => entry.toLowerCase()));
+  return scope.split(/\s+/).filter((entry) => entry && !omitted.has(entry.toLowerCase())).join(" ");
+}
+
+export interface MockGoogleThread {
+  id: string;
+  messages: Record<string, unknown>[];
+  /** Undefined preserves the default; null omits threadId from drafts.create. */
+  returnedThreadId?: string | null;
 }
 
 interface StartedMockGoogleServer {
@@ -28,6 +57,7 @@ interface RequestEntry {
   path: string;
   url: string;
   at: string;
+  email?: string;
 }
 
 interface PendingAuthorization {
@@ -53,6 +83,10 @@ interface RecordedDraft {
   to: string;
   body: string;
   threadId?: string;
+  draftId?: string;
+  messageId?: string;
+  returnedThreadId?: string | null;
+  raw?: string;
   attachments?: RecordedAttachment[];
   tokenId: string;
   at: string;
@@ -70,6 +104,22 @@ interface RecordedDriveUpload extends RecordedAttachment {
   at: string;
 }
 
+interface DriveSession {
+  email: string;
+  tokenId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  chunks: Buffer[];
+  received: number;
+  /** Replaces this file's content instead of creating a file. */
+  fileId?: string;
+  /** Drive type to create, which converts the upload when it is a Google Docs type. */
+  targetMimeType?: string;
+  parents?: string[];
+  file?: Record<string, unknown>;
+}
+
 interface SigningKeys {
   keyId: string;
   privateKeyPem: string;
@@ -78,6 +128,8 @@ interface SigningKeys {
 interface MockGoogleState {
   accounts: Account[];
   autoApprove: boolean;
+  accessTokenTtlSeconds: number;
+  tokenScopes: MockTokenScopes;
   baseUrl: string;
   requests: RequestEntry[];
   pending: Map<string, PendingAuthorization>;
@@ -85,8 +137,12 @@ interface MockGoogleState {
   accessTokens: Map<string, Account>;
   refreshTokens: Map<string, RefreshCredential>;
   drafts: Map<string, RecordedDraft[]>;
+  threads: Record<string, MockGoogleThread[]>;
   driveUploads: Map<string, RecordedDriveUpload[]>;
+  driveSessions: Map<string, DriveSession>;
   keys: SigningKeys;
+  actions: ReturnType<typeof serviceActionsWitness>;
+  drive: ReturnType<typeof mockDrive>;
 }
 
 const HTML_ENTITIES: Record<string, string> = {
@@ -216,11 +272,13 @@ function accountForRequest(state: MockGoogleState, request: IncomingMessage): Ac
 }
 
 function recordRequest(state: MockGoogleState, request: IncomingMessage, url: URL): void {
+  const account = accountForRequest(state, request);
   state.requests.push({
     method: method(request),
     path: url.pathname,
     url: `${url.pathname}${url.search}`,
     at: new Date().toISOString(),
+    ...(account ? { email: account.email } : {}),
   });
 }
 
@@ -380,8 +438,8 @@ async function token(state: MockGoogleState, request: IncomingMessage, response:
     access_token: issued.accessToken,
     refresh_token: issued.refreshToken,
     token_type: "Bearer",
-    expires_in: 3600,
-    scope: credential.scope,
+    expires_in: state.accessTokenTtlSeconds,
+    scope: reportedScope(state.tokenScopes, credential.scope),
     id_token: issued.idToken,
   });
 }
@@ -427,19 +485,19 @@ function decodeBase64Body(body: string): string {
   }
 }
 
-function mimeTextBody(headers: string, body: string): string | null {
+function mimeTextBody(headers: string, body: string, mimeType = "text/plain"): string | null {
   const contentType = headerValue(headers, "content-type");
   const boundary = /boundary="?([^";]+)"?/i.exec(contentType)?.[1] ?? null;
   if (boundary) {
     for (const part of body.split(`--${boundary}`).slice(1)) {
       if (!part.trim() || part.trim().startsWith("--")) continue;
       const split = splitMessage(part.replace(/^\r?\n/, ""));
-      const decoded = mimeTextBody(split.headers, split.body);
+      const decoded = mimeTextBody(split.headers, split.body, mimeType);
       if (decoded !== null) return decoded;
     }
     return null;
   }
-  if (contentType && !contentType.toLowerCase().startsWith("text/plain")) return null;
+  if (contentType && !contentType.toLowerCase().startsWith(mimeType)) return null;
   return headerValue(headers, "content-transfer-encoding").toLowerCase() === "base64"
     ? decodeBase64Body(body)
     : body.trimEnd();
@@ -447,6 +505,22 @@ function mimeTextBody(headers: string, body: string): string | null {
 
 function draftBody(headers: string, body: string): string {
   return mimeTextBody(headers, body) ?? "";
+}
+
+/** Decode only provider-observed bytes, independently of the product MIME writer. */
+export function parseMockGmailMime(raw: string) {
+  const message = decodedRawMessage(raw);
+  const { headers, body } = splitMessage(message);
+  const subject = headerValue(headers, "subject")
+    .replace(/(\?=)[ \t]+(?==\?)/g, "$1")
+    .replace(/=\?UTF-8\?B\?([^?]+)\?=/gi, (_, encoded: string) => decodeBase64Body(encoded));
+  return {
+    raw: message, headers, subject,
+    inReplyTo: headerValue(headers, "in-reply-to"),
+    references: headerValue(headers, "references"),
+    plain: mimeTextBody(headers, body),
+    html: mimeTextBody(headers, body, "text/html"),
+  };
 }
 
 function unquoteMimeParameter(value: string): string {
@@ -495,6 +569,12 @@ async function createDraft(state: MockGoogleState, request: IncomingMessage, res
     return;
   }
   const input = draftInput(await jsonBody(request));
+  const configuredThread = state.threads[account.email]?.find((thread) => thread.id === input.threadId);
+  const returnedThreadId = configuredThread?.returnedThreadId === undefined
+    ? input.threadId ?? `thread-${randomUUID()}`
+    : configuredThread.returnedThreadId;
+  const draftId = `draft-${randomUUID()}`;
+  const messageId = `msg-${randomUUID()}`;
   const message = decodedRawMessage(input.raw);
   const split = splitMessage(message);
   const draft: RecordedDraft = {
@@ -502,6 +582,7 @@ async function createDraft(state: MockGoogleState, request: IncomingMessage, res
     body: draftBody(split.headers, split.body),
     tokenId: tokenId(accessToken),
     at: new Date().toISOString(),
+    draftId, messageId, returnedThreadId, raw: input.raw,
   };
   if (input.threadId) draft.threadId = input.threadId;
   const attachments = mimeAttachments(split.headers, split.body);
@@ -509,10 +590,9 @@ async function createDraft(state: MockGoogleState, request: IncomingMessage, res
   const mailbox = state.drafts.get(account.email) ?? [];
   mailbox.push(draft);
   state.drafts.set(account.email, mailbox);
-  const threadId = input.threadId ?? `thread-${randomUUID()}`;
   sendJson(response, 200, {
-    id: `draft-${randomUUID()}`,
-    message: { id: `msg-${randomUUID()}`, threadId },
+    id: draftId,
+    message: { id: messageId, ...(returnedThreadId === null ? {} : { threadId: returnedThreadId }) },
   });
 }
 
@@ -581,6 +661,53 @@ async function createDriveUpload(state: MockGoogleState, request: IncomingMessag
   });
 }
 
+async function driveResumable(state: MockGoogleState, request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+  const replaceId = /^\/upload\/drive\/v3\/files\/([A-Za-z0-9_-]+)$/.exec(url.pathname)?.[1];
+  if (request.method === "POST" || (request.method === "PATCH" && replaceId)) {
+    const account = accountForRequest(state, request);
+    const token = bearerToken(request);
+    if (!account || !token) { sendJson(response, 401, { error: "unauthorized" }); return; }
+    const metadata: unknown = JSON.parse((await requestBuffer(request)).toString());
+    const size = Number(requestHeader(request, "x-upload-content-length"));
+    if (!isRecord(metadata) || (!replaceId && typeof metadata.name !== "string") || !Number.isSafeInteger(size) || size < 1) { sendJson(response, 400, { error: "bad_metadata" }); return; }
+    if (replaceId && !state.drive.owns(account.email, replaceId)) { sendJson(response, 404, { error: { code: 404, message: `File not found: ${replaceId}.`, errors: [{ reason: "notFound" }] } }); return; }
+    const id = randomUUID();
+    state.driveSessions.set(id, {
+      email: account.email, tokenId: tokenId(token), filename: typeof metadata.name === "string" ? metadata.name : "", mimeType: requestHeader(request, "x-upload-content-type"), size, chunks: [], received: 0,
+      ...(replaceId ? { fileId: replaceId } : {}),
+      ...(typeof metadata.mimeType === "string" ? { targetMimeType: metadata.mimeType } : {}),
+      ...(Array.isArray(metadata.parents) ? { parents: metadata.parents.filter((parent): parent is string => typeof parent === "string") } : {}),
+    });
+    const location = new URL(url.pathname, state.baseUrl);
+    location.searchParams.set("uploadType", "resumable"); location.searchParams.set("upload_id", id);
+    response.writeHead(200, { location: location.href }); response.end(); return;
+  }
+  const session = state.driveSessions.get(url.searchParams.get("upload_id") ?? "");
+  if (!session) { sendJson(response, 404, { error: "session_expired" }); return; }
+  // A session is a bearer URL: uploading needs no account token, and callers must not forward it.
+  if (requestHeader(request, "authorization")) { sendJson(response, 400, { error: "unexpected_authorization" }); return; }
+  if (request.method === "DELETE") { state.driveSessions.delete(url.searchParams.get("upload_id") ?? ""); sendJson(response, 200, {}); return; }
+  if (session.file) { sendJson(response, 200, session.file); return; }
+  const content = await requestBuffer(request);
+  const range = requestHeader(request, "content-range");
+  // Like Google, a single PUT of the whole file needs no Content-Range.
+  if (!range && session.received === 0 && content.byteLength === session.size) {
+    session.chunks.push(content); session.received = content.byteLength;
+  } else if (range !== `bytes */${session.size}`) {
+    const match = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(range);
+    if (!match || Number(match[1]) !== session.received || Number(match[2]) - Number(match[1]) + 1 !== content.byteLength || Number(match[3]) !== session.size) { sendJson(response, 400, { error: "bad_range" }); return; }
+    session.chunks.push(content); session.received += content.byteLength;
+  }
+  if (session.received !== session.size) { response.writeHead(308, session.received ? { range: `bytes=0-${session.received - 1}` } : {}); response.end(); return; }
+  const at = new Date().toISOString();
+  const recorded = { filename: session.filename, mimeType: session.mimeType, size: session.size, dataBase64: Buffer.concat(session.chunks).toString("base64"), tokenId: session.tokenId, at };
+  const uploads = state.driveUploads.get(session.email) ?? []; uploads.push(recorded); state.driveUploads.set(session.email, uploads);
+  const uploaded = Buffer.concat(session.chunks);
+  session.file = (session.fileId ? state.drive.replace(session.email, session.fileId, uploaded) : null)
+    ?? state.drive.create(session.email, { name: session.filename, mimeType: session.targetMimeType ?? session.mimeType, uploadMimeType: session.mimeType, content: uploaded, parents: session.parents ?? [] });
+  sendJson(response, 200, session.file);
+}
+
 function pendingAuthorizations(state: MockGoogleState): unknown {
   return {
     pending: Array.from(state.pending.values()).map((entry) => ({
@@ -611,6 +738,30 @@ async function handleRequest(state: MockGoogleState, request: IncomingMessage, r
     sendJson(response, 200, { requests: state.requests });
     return;
   }
+  if (requestMethod === "POST" && url.pathname === "/__mock-google/revoke") {
+    // Models a member removing the app's access: every grant for the account stops working.
+    const email = (url.searchParams.get("email") ?? "").toLowerCase();
+    for (const [value, credential] of state.refreshTokens) if (credential.account.email === email) state.refreshTokens.delete(value);
+    for (const [value, account] of state.accessTokens) if (account.email === email) state.accessTokens.delete(value);
+    sendJson(response, 200, { ok: true });
+    return;
+  }
+  if (requestMethod === "GET" && url.pathname === "/__mock-google/actions") {
+    sendJson(response, 200, state.actions.snapshot(url.searchParams.get("email") ?? ""));
+    return;
+  }
+  if (requestMethod === "GET" && url.pathname === "/__mock-google/drive-files") {
+    sendJson(response, 200, { files: state.drive.snapshot(url.searchParams.get("email") ?? "") });
+    return;
+  }
+  if (requestMethod === "POST" && url.pathname === "/__mock-google/drive-files/edit") {
+    const edited = state.drive.edit(url.searchParams.get("email") ?? "", url.searchParams.get("id") ?? "", await requestBuffer(request));
+    sendJson(response, edited ? 200 : 404, { ok: edited });
+    return;
+  }
+  const accessToken = bearerToken(request);
+  if (await state.actions.handle(request, response, url, accountForRequest(state, request)?.email ?? null, accessToken ? tokenId(accessToken) : null)) return;
+  if (state.drive.handle(request, response, url, accountForRequest(state, request)?.email ?? null)) return;
   if (requestMethod === "GET" && url.pathname === "/__mock-google/pending-authorizations") {
     sendJson(response, 200, pendingAuthorizations(state));
     return;
@@ -660,8 +811,23 @@ async function handleRequest(state: MockGoogleState, request: IncomingMessage, r
     sendJson(response, 200, { messages: [], resultSizeEstimate: 0 });
     return;
   }
+  if (requestMethod === "GET" && url.pathname.startsWith("/gmail/v1/users/me/threads/")) {
+    const account = accountForRequest(state, request);
+    if (!account) {
+      sendJson(response, 401, { error: { code: 401, message: "Invalid Credentials" } });
+      return;
+    }
+    const id = decodeURIComponent(url.pathname.slice("/gmail/v1/users/me/threads/".length));
+    const thread = state.threads[account.email]?.find((entry) => entry.id === id);
+    sendJson(response, thread ? 200 : 404, thread ? { id: thread.id, messages: thread.messages } : { error: { code: 404, message: "Thread not found" } });
+    return;
+  }
   if (requestMethod === "POST" && url.pathname === "/gmail/v1/users/me/drafts") {
     await createDraft(state, request, response);
+    return;
+  }
+  if (/^\/upload\/drive\/v3\/files(?:\/[A-Za-z0-9_-]+)?$/.test(url.pathname) && url.searchParams.get("uploadType") === "resumable") {
+    await driveResumable(state, request, response, url);
     return;
   }
   if (requestMethod === "POST" && url.pathname === "/upload/drive/v3/files") {
@@ -703,6 +869,8 @@ export async function startMockGoogleServer(options: MockGoogleServerOptions): P
   const state: MockGoogleState = {
     accounts: normalizeAccounts(options.accounts),
     autoApprove: options.autoApprove,
+    accessTokenTtlSeconds: options.accessTokenTtlSeconds ?? 3600,
+    tokenScopes: options.tokenScopes ?? "echo",
     baseUrl: options.baseUrl ?? "http://127.0.0.1",
     requests: [],
     pending: new Map(),
@@ -710,8 +878,12 @@ export async function startMockGoogleServer(options: MockGoogleServerOptions): P
     accessTokens: new Map(),
     refreshTokens: new Map(),
     drafts: new Map(),
+    threads: options.threads ?? {},
     driveUploads: new Map(),
+    driveSessions: new Map(),
     keys: createSigningKeys(),
+    actions: serviceActionsWitness(),
+    drive: mockDrive(options.driveFiles),
   };
   const server = createServer((request, response) => {
     void handleRequest(state, request, response).catch((error) => {

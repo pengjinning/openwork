@@ -1,554 +1,153 @@
 "use client";
 
 import * as React from "react";
-import { ChevronDown, Settings2 } from "lucide-react";
-import { useNavigate } from "react-router";
-
+import { Check, ChevronDown, ChevronLeft, ChevronRight } from "lucide-react";
+import { useIsMobile } from "@/hooks/use-mobile";
 import type { ModelOption, ModelRef } from "@/app/types";
-import { ProviderIcon } from "@/react-app/design-system/provider-icon";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { FAST_PRICING_WARNING, getModelBehaviorControls, getModelBehaviorSelection } from "@/app/lib/model-behavior";
+import { FAST_DEFAULT_VARIANT } from "@openwork/types/cloud-model-fast";
+import { fastModeShortcutLabel } from "@/react-app/shell/fast-mode-shortcut";
+import { resolveThinkingModeShortcutOs, thinkingModeShortcutLabel } from "@/react-app/shell/thinking-mode-shortcut";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { ModelPickerList } from "@/react-app/domains/models/model-picker-list";
+import { useModelCatalog, useModelChoice } from "@/react-app/domains/models/use-model-catalog";
 import { useWorkspace } from "@/react-app/shell/workspace-provider";
-import { usePlatform } from "@/react-app/kernel/platform";
+import { useSetWorkspaceDefaultModel } from "@/react-app/kernel/use-workspace-model-default";
 import { useCheckDesktopRestriction } from "@/react-app/domains/cloud/desktop-config-provider";
-import { useDenAuth } from "@/react-app/domains/cloud/den-auth-provider";
-import {
-  getOpenWorkModelsActionUrl,
-  hasOpenWorkModelsProvider,
-  hideOpenWorkModelsPromo,
-  useOpenWorkModelsPromoEligibility,
-  isOpenWorkModelsPromoHidden,
-  OPENWORK_MODEL_PREVIEWS,
-  OPENWORK_MODELS_PROVIDER_ID,
-  OPENWORK_MODELS_PROVIDER_NAME,
-  openWorkModelsPromoChangedEvent,
-} from "@/react-app/domains/cloud/openwork-models-promo";
-import { getConnectedProviderItems, useProviderListQuery } from "@/react-app/infra/provider-list-query";
-import { filterEntitledModelOptions } from "@/react-app/domains/connections/provider-auth/provider-policy";
-import {
-  filterCloudManagedModelOptions,
-  mergeModelOptions,
-} from "@/react-app/domains/connections/provider-auth/assigned-model-options";
-import { isCloudManagedProviderKey } from "@/react-app/domains/connections/provider-auth/cloud-provider-config";
-import {
-  Command,
-  CommandCollection,
-  CommandEmpty,
-  CommandGroup,
-  CommandGroupLabel,
-  CommandHeader,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
+import { AutoAccessFooter, openAutoProviderSettings } from "@/react-app/domains/cloud/auto-access-ui";
 import { openModelPickerEvent, openProviderAuthEvent } from "@/react-app/shell/new-providers-listener";
-import { newProvidersEvent } from "@/app/lib/provider-events";
-
-/** Shown with their logos when no keys are connected yet. */
-const SUGGESTED_KEY_PROVIDERS = [
-  { id: "anthropic", name: "Anthropic" },
-  { id: "openai", name: "OpenAI" },
-  { id: "google", name: "Google" },
-];
-
-function getProviderDisplayName(providerId: string) {
-  return providerId
-    .split("-")
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
-function useModelOptions(
-  open: boolean,
-  fallbackOptions: readonly ModelOption[],
-  cloudProvidersEnabled: boolean,
-) {
-  const { client, opencodeBaseUrl, selectedWorkspaceRoot } = useWorkspace();
-  const checkDesktopRestriction = useCheckDesktopRestriction();
-
-  const { data, refetch } = useProviderListQuery({
-    client,
-    baseUrl: opencodeBaseUrl,
-    directory: selectedWorkspaceRoot,
-    enabled: Boolean(client),
-  });
-
-  React.useEffect(() => {
-    if (!open || !client) return;
-    void refetch();
-  }, [client, open, refetch]);
-
-  React.useEffect(() => {
-    if (!client) return;
-    const handler = () => {
-      void refetch();
-    };
-    window.addEventListener(newProvidersEvent, handler);
-    return () => window.removeEventListener(newProvidersEvent, handler);
-  }, [client, refetch]);
-
-  // Apply org-level restrictions (dev #1505) on top of the raw model list
-  // so the picker never surfaces blocked options:
-  //   - `allowZenModel` hides the built-in OpenCode provider entries when false
-  //   - `allowCustomProviders` keeps org-managed providers, plus Zen when allowed.
-  return React.useMemo(() => {
-    const restrictToCloud = checkDesktopRestriction({
-      restriction: "allowCustomProviders",
-    });
-
-    const options = getConnectedProviderItems(data)
-      .flatMap((provider) =>
-        Object.entries(provider.models).map(([id, model]) => ({
-          providerID: provider.id,
-          modelID: id,
-          title: model.name,
-          description: provider.name,
-          behaviorTitle: "Reasoning",
-          behaviorLabel: "Default",
-          behaviorDescription: "",
-          behaviorValue: null,
-          isFree: false,
-        })),
-      );
-
-    return filterEntitledModelOptions(filterCloudManagedModelOptions(
-      mergeModelOptions(options, fallbackOptions),
-      cloudProvidersEnabled,
-    ), {
-      restrictToCloud,
-      checkRestriction: checkDesktopRestriction,
-    });
-  }, [checkDesktopRestriction, cloudProvidersEnabled, data, fallbackOptions]);
-}
-
-type ModelSelectModelItem = {
-  kind: "model";
-  id: string;
-  option: ModelOption;
-};
-
-type ModelSelectOpenWorkItem = {
-  kind: "openwork";
-  id: string;
-  title: string;
-  subtitle: string;
-};
-
-type ModelSelectItem = ModelSelectModelItem | ModelSelectOpenWorkItem;
-
-type ModelSelectGroup = {
-  value: string;
-  items: ModelSelectItem[];
-  promo: boolean;
-};
-
-function groupByProvider(modelOptions: ModelOption[]): ModelSelectGroup[] {
-  const groups = new Map<string, ModelSelectModelItem[]>();
-
-  for (const option of modelOptions) {
-    const providerLabel = option.description ?? getProviderDisplayName(option.providerID);
-    const item: ModelSelectModelItem = {
-      kind: "model",
-      id: `${option.providerID}:${option.modelID}`,
-      option,
-    };
-    const existing = groups.get(providerLabel);
-
-    if (existing) {
-      existing.push(item);
-      continue;
-    }
-
-    groups.set(providerLabel, [item]);
-  }
-
-  return [...groups.entries()]
-    .map(([providerLabel, options]) => ({
-      value: providerLabel,
-      items: [...options].sort((a, b) => a.option.title.localeCompare(b.option.title)),
-      promo: false,
-    }))
-    .sort((a, b) => a.value.localeCompare(b.value));
-}
-
-function openWorkModelsGroup(): ModelSelectGroup {
-  return {
-    value: OPENWORK_MODELS_PROVIDER_NAME,
-    promo: true,
-    items: OPENWORK_MODEL_PREVIEWS.map((model) => ({
-      kind: "openwork",
-      id: model.id,
-      title: model.title,
-      subtitle: model.subtitle,
-    })),
-  };
-}
-
-function isSameModel(a: ModelRef, b: ModelRef) {
-  return a.providerID === b.providerID && a.modelID === b.modelID;
-}
+import { openComposerModelPickerEvent } from "@/app/lib/inference-access";
+import { isAutoModel, modelTitle, nonDefaultModelSummary, type RetainedModelSelection } from "@/react-app/domains/models/model-catalog";
+import { useModelPickerCatalogStore } from "@/react-app/domains/session/models/model-collections-store";
 
 interface ModelSelectProps {
   open: boolean;
   value: ModelRef;
   hideValue?: boolean;
   onOpenChange: (open: boolean) => void;
-  onChange: (model: ModelRef) => void;
+  onChange: (model: ModelRef, variant?: string | null) => void;
   disabled?: boolean;
-  /** When set, "All models" opens the full picker scoped to this session. */
   sessionId?: string;
-  /** Den/import includes OpenWork Models — never show Subscribe while true. */
   openWorkModelsEntitled?: boolean;
-  /** The server is waiting to reload this workspace with OpenWork Models. */
   openWorkModelsSyncing?: boolean;
-  /** Member-scoped models available before a workspace OpenCode client exists. */
   fallbackOptions?: readonly ModelOption[];
+  behaviorValue?: string | null;
+  behaviorLabel?: string;
+  behaviorOptions?: { value: string | null; label: string }[];
+  onBehaviorChange?: (value: string | null) => void;
+  onSetWorkspaceDefault?: (model: ModelRef, variant?: string | null) => void | boolean | Promise<void | boolean>;
+  onReloadWorkspace?: () => void | Promise<unknown>;
+  retainedSelection?: RetainedModelSelection;
 }
 
-export function ModelSelect({
-  open,
-  value,
-  hideValue = false,
-  onOpenChange,
-  onChange,
-  disabled = false,
-  sessionId,
-  openWorkModelsEntitled = false,
-  openWorkModelsSyncing = false,
-  fallbackOptions = [],
-}: ModelSelectProps) {
-  const [search, setSearch] = React.useState("");
-  const [promoHidden, setPromoHidden] = React.useState(isOpenWorkModelsPromoHidden);
+export function ModelSelect({ open, value, hideValue = false, onOpenChange, onChange, disabled = false, sessionId,
+  openWorkModelsSyncing = false, fallbackOptions = [], behaviorValue = null, behaviorOptions = [], onBehaviorChange, onSetWorkspaceDefault, onReloadWorkspace, retainedSelection: savedSelection }: ModelSelectProps) {
+  const [query, setQuery] = React.useState("");
+  const [effort, setEffort] = React.useState(false);
+  const [focusAlternative, setFocusAlternative] = React.useState(false);
+  const isMobile = useIsMobile();
+  const popupRef = React.useRef<HTMLDivElement>(null);
   const searchInputRef = React.useRef<HTMLInputElement>(null);
-  const denAuth = useDenAuth();
-  const modelOptions = useModelOptions(open, fallbackOptions, denAuth.isSignedIn);
-  const navigate = useNavigate();
-  const platform = usePlatform();
-  const openWorkModelsPromoEligible = useOpenWorkModelsPromoEligibility();
-  const checkDesktopRestriction = useCheckDesktopRestriction();
-  const canAddProviders = !checkDesktopRestriction({ restriction: "allowCustomProviders" });
-
+  const effortButtonRef = React.useRef<HTMLButtonElement>(null);
+  const backButtonRef = React.useRef<HTMLButtonElement>(null);
+  const previousEffort = React.useRef(effort);
+  React.useLayoutEffect(() => {
+    const previous = previousEffort.current;
+    previousEffort.current = effort;
+    if (!open || previous === effort) return;
+    (effort ? backButtonRef.current : effortButtonRef.current)?.focus({ preventScroll: true });
+  }, [effort, open]);
+  const workspace = useWorkspace();
+  const setWorkspaceDefault = useSetWorkspaceDefaultModel();
+  const checkRestriction = useCheckDesktopRestriction();
+  const choice = useModelChoice(JSON.stringify([sessionId, value, behaviorValue, disabled]));
+  const catalog = useModelCatalog({ client: workspace.client, baseUrl: workspace.opencodeBaseUrl, directory: workspace.selectedWorkspaceRoot,
+    enabled: true, refreshWhen: open, fallbackOptions, pendingOptions: choice.pendingOptions, disabledProviders: choice.disabledProviders,
+    current: value, savedSelection, sessionScoped: Boolean(sessionId), openWorkModelsSyncing });
+  const { options, catalogState, retainedSelection, restrictToCloud, autoVisible } = catalog;
   React.useEffect(() => {
-    const handlePromoChanged = () => setPromoHidden(isOpenWorkModelsPromoHidden());
-    window.addEventListener(openWorkModelsPromoChangedEvent, handlePromoChanged);
-    return () => window.removeEventListener(openWorkModelsPromoChangedEvent, handlePromoChanged);
-  }, []);
-
-  const focusSearchInput = React.useCallback(() => {
-    window.requestAnimationFrame(() => {
-      const input = searchInputRef.current;
-
-      if (!input) {
-        return;
-      }
-
-      input.focus();
-      input.select();
-    });
-  }, []);
-
+    const recover = (event: Event) => {
+      if (!(event instanceof CustomEvent) || event.detail?.sessionId !== sessionId) return;
+      setQuery(""); setEffort(false); setFocusAlternative(true); onOpenChange(true);
+    };
+    window.addEventListener(openComposerModelPickerEvent, recover);
+    return () => window.removeEventListener(openComposerModelPickerEvent, recover);
+  }, [sessionId, onOpenChange]);
+  // The palette and shortcuts for this conversation switch among exactly these models.
+  const catalogOwner = React.useRef(Symbol());
+  React.useLayoutEffect(() => {
+    if (sessionId) useModelPickerCatalogStore.getState().publish(sessionId, catalogOwner.current, catalog.actionOptions);
+  }, [sessionId, catalog.actionOptions]);
   React.useEffect(() => {
-    if (!open) {
-      return;
-    }
-
-    focusSearchInput();
-  }, [focusSearchInput, open]);
-
-  const selectedOption = modelOptions?.find((option) =>
-    isSameModel(value, {
-      providerID: option.providerID,
-      modelID: option.modelID,
-    }),
-  );
-
-  const openWorkModelsAvailable = React.useMemo(
-    () => hasOpenWorkModelsProvider(modelOptions.map((option) => option.providerID)),
-    [modelOptions],
-  );
-  const showOpenWorkModelsPromo = React.useMemo(
-    () =>
-      openWorkModelsPromoEligible &&
-      !promoHidden &&
-      !openWorkModelsAvailable &&
-      !openWorkModelsEntitled,
-    [openWorkModelsAvailable, openWorkModelsEntitled, openWorkModelsPromoEligible, promoHidden],
-  );
-
-  const groups = React.useMemo(() => {
-    const providerGroups = groupByProvider(modelOptions);
-    return showOpenWorkModelsPromo
-      ? [openWorkModelsGroup(), ...providerGroups]
-      : providerGroups;
-  }, [modelOptions, showOpenWorkModelsPromo]);
-
-  const handleSelect = (option: ModelOption) => {
+    const owner = catalogOwner.current;
+    return () => { if (sessionId) useModelPickerCatalogStore.getState().release(sessionId, owner); };
+  }, [sessionId]);
+  const selected = options.find((option) => option.providerID === value.providerID && option.modelID === value.modelID);
+  const selectedBehavior = getModelBehaviorSelection(selected?.behaviorOptions ?? behaviorOptions, behaviorValue);
+  const controls = getModelBehaviorControls(selectedBehavior.options, selectedBehavior.value);
+  const hasEffort = behaviorValue !== null || (selected?.behaviorOptions ?? behaviorOptions).some((option) => option.value !== null);
+  // Fast shows on its own as a quiet "· Fast" after the model name; the effort beside it is the base level ("High", not "High + Fast").
+  const fastOn = controls.fast && !isAutoModel(value);
+  const summary = fastOn
+    ? (behaviorValue === FAST_DEFAULT_VARIANT ? null : controls.options.find((option) => option.value === behaviorValue)?.label ?? null)
+    : nonDefaultModelSummary(value, behaviorValue, selectedBehavior.label);
+  const shortcutOs = resolveThinkingModeShortcutOs(undefined, typeof navigator === "undefined" ? "" : navigator.platform);
+  const fastShortcutLabel = fastModeShortcutLabel(shortcutOs);
+  const effortShortcutLabel = thinkingModeShortcutLabel(shortcutOs);
+  const autoSelected = isAutoModel(value);
+  const canChangeEffort = Boolean(selected && onBehaviorChange && !autoSelected && hasEffort);
+  const effortValueLabel = autoSelected ? "Managed by Auto" : hasEffort ? controls.options.find((option) => option.value === behaviorValue)?.label ?? selectedBehavior.label : "Unavailable";
+  const select = (option: ModelOption) => choice.choose(option, () => {
     onChange({ providerID: option.providerID, modelID: option.modelID });
-    setSearch("");
     onOpenChange(false);
-  };
-
-  const handleOpenWorkModels = React.useCallback(() => {
-    onOpenChange(false);
-    setSearch("");
-    if (!denAuth.isSignedIn) {
-      navigate("/settings/cloud-account");
-    }
-    window.setTimeout(() => {
-      platform.openLink(getOpenWorkModelsActionUrl(denAuth.isSignedIn));
-    }, 0);
-  }, [denAuth.isSignedIn, navigate, onOpenChange, platform]);
-
-  const handleHideOpenWorkModels = React.useCallback(() => {
-    hideOpenWorkModelsPromo();
-    setPromoHidden(true);
-  }, []);
-
-  // Providers the user connected with their own key — OpenCode Zen and
-  // OpenWork Models are managed for them, so they never count as "your keys".
-  const keyProviders = React.useMemo(() => {
-    const seen = new Map<string, string>();
-    for (const option of modelOptions) {
-      const id = option.providerID.trim().toLowerCase();
-      if (!id || id === "opencode" || id === OPENWORK_MODELS_PROVIDER_ID) continue;
-      if (seen.has(id)) continue;
-      seen.set(id, option.description ?? getProviderDisplayName(option.providerID));
-    }
-    return [...seen].map(([id, name]) => ({ id, name }));
-  }, [modelOptions]);
-
-  const hasKeyProviders = keyProviders.length > 0;
-  const keyProviderPreview = hasKeyProviders
-    ? keyProviders.slice(0, 3)
-    : SUGGESTED_KEY_PROVIDERS;
-
-  const handleConnectProvider = React.useCallback(() => {
-    onOpenChange(false);
-    setSearch("");
-    window.dispatchEvent(new Event(openProviderAuthEvent));
-  }, [onOpenChange]);
-
-  return (
-    <Popover
-      open={open}
-      onOpenChange={(nextOpen) => {
-        onOpenChange(nextOpen);
-
-        if (!nextOpen) {
-          setSearch("");
-        }
-      }}
-    >
-      <Tooltip>
-        <TooltipTrigger
-          render={
-            <PopoverTrigger
-              type="button"
-              disabled={disabled}
-              aria-label="Change model"
-              aria-keyshortcuts="Meta+Alt+/"
-              className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-gray-10 transition-colors hover:bg-gray-3 hover:text-gray-12 disabled:pointer-events-none disabled:opacity-60"
-            />
-          }
-        >
-          <span className="max-w-48 truncate">
-            {hideValue || (!denAuth.isSignedIn && isCloudManagedProviderKey(value.providerID))
-              ? "Select model"
-              : (selectedOption?.title ?? value.modelID ?? "Select model")}
-          </span>
-          <ChevronDown className="h-3 w-3" />
-        </TooltipTrigger>
-        <TooltipContent>
-          Change model
-        </TooltipContent>
-      </Tooltip>
-      <PopoverContent
-        className="h-80 max-h-(--available-height) w-72 gap-0 overflow-hidden p-px **:data-[slot=scroll-area-viewport]:data-has-overflow-y:pe-0.5"
-        align="start"
-        initialFocus={false}
-      >
-        <Command items={groups} value={search} onValueChange={setSearch}>
-          <CommandHeader>
-            <CommandInput
-              ref={searchInputRef}
-              placeholder="Search models..."
-            />
-          </CommandHeader>
-          <CommandEmpty>No models found.</CommandEmpty>
-          {openWorkModelsSyncing ? (
-            <div className="mx-1 mb-1 flex items-center gap-2 rounded-md border border-amber-6/60 bg-amber-2/40 px-2 py-1.5">
-              <ProviderIcon
-                providerId={OPENWORK_MODELS_PROVIDER_ID}
-                providerName={OPENWORK_MODELS_PROVIDER_NAME}
-                className="size-3.5 shrink-0 text-amber-11"
-                size={14}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs font-medium text-foreground">
-                  {OPENWORK_MODELS_PROVIDER_NAME}
-                </span>
-                <span className="block truncate text-[11px] text-muted-foreground">
-                  Included — pending workspace reload…
-                </span>
-              </span>
-            </div>
-          ) : null}
-          <CommandList>
-            {(group: ModelSelectGroup) => (
-              <CommandGroup
-                key={group.value}
-                items={group.items}
-              >
-                <CommandGroupLabel className={group.promo ? "flex items-baseline justify-between gap-2" : undefined}>
-                  {group.promo ? (
-                    <>
-                      <span>{group.value}</span>
-                      <span className="shrink-0 font-normal text-muted-foreground">hosted · no API keys</span>
-                    </>
-                  ) : (
-                    group.value
-                  )}
-                </CommandGroupLabel>
-                <CommandCollection>
-                  {(item: ModelSelectItem) => {
-                    if (item.kind === "openwork") {
-                      return (
-                        <CommandItem
-                          className="gap-2"
-                          key={item.id}
-                          value={`${OPENWORK_MODELS_PROVIDER_NAME} ${item.title} ${item.id} sign in subscribe`}
-                          onClick={handleOpenWorkModels}
-                        >
-                          <ProviderIcon
-                            providerId={OPENWORK_MODELS_PROVIDER_ID}
-                            providerName={OPENWORK_MODELS_PROVIDER_NAME}
-                            className="size-3.5 opacity-70"
-                            size={14}
-                          />
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-foreground">
-                              {item.title}
-                            </span>
-                          </span>
-                        </CommandItem>
-                      );
-                    }
-
-                    const option = item.option;
-                    return (
-                      <CommandItem
-                        className="gap-2"
-                        key={item.id}
-                        value={`${option.providerID}:${option.modelID} ${option.title} ${option.description ?? ""}`}
-                        onClick={() => handleSelect(option)}
-                        data-checked={isSameModel(value, option)}
-                      >
-                        <ProviderIcon
-                          providerId={option.providerID}
-                          providerName={option.description}
-                          className="size-3.5 opacity-70"
-                          size={14}
-                        />
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-foreground">
-                            {option.title}
-                          </span>
-                          <span className="block truncate text-xs text-muted-foreground">
-                            {option.description ??
-                              getProviderDisplayName(option.providerID)}
-                          </span>
-                        </span>
-                      </CommandItem>
-                    );
-                  }}
-                </CommandCollection>
-                {group.promo ? (
-                  <button
-                    type="button"
-                    className="mx-1 mb-1.5 mt-1 flex w-[calc(100%-0.5rem)] items-center gap-2 rounded-md bg-blue-2 px-3 py-2 text-left transition-colors hover:bg-blue-3"
-                    onClick={handleOpenWorkModels}
-                  >
-                    <span className="min-w-0 flex-1 text-xs leading-4 text-foreground">
-                      One subscription unlocks these in every workspace.
-                    </span>
-                    <span className="shrink-0 text-xs font-semibold text-blue-11">
-                      {denAuth.isSignedIn ? "Enable →" : "Sign in →"}
-                    </span>
-                  </button>
-                ) : null}
-              </CommandGroup>
-            )}
-          </CommandList>
-          {/* Your API keys → provider configuration. One slot, one action: the
-              label reflects whether any keys are connected yet. */}
-          {canAddProviders ? (
-            <div className="border-t border-border p-1">
-              <div className="flex items-baseline px-2 pb-0.5 pt-1 text-xs text-muted-foreground">
-                Your API keys
-              </div>
-              <button
-                type="button"
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground"
-                onClick={handleConnectProvider}
-              >
-                <span className="flex shrink-0 items-center">
-                  {keyProviderPreview.map((provider, index) => (
-                    <span
-                      key={provider.id}
-                      className="flex size-[18px] items-center justify-center overflow-hidden rounded-[6px] border border-border bg-background"
-                      style={index === 0 ? undefined : { marginLeft: "-5px" }}
-                    >
-                      <ProviderIcon providerId={provider.id} providerName={provider.name} size={12} />
-                    </span>
-                  ))}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-foreground">
-                  {keyProviderPreview.map((provider) => provider.name).join(", ")}
-                  {!hasKeyProviders || keyProviders.length > keyProviderPreview.length ? "…" : ""}
-                </span>
-                <span className="shrink-0 text-xs font-medium text-muted-foreground">
-                  {hasKeyProviders ? "Connect more providers" : "Add your keys"}
-                </span>
-              </button>
-            </div>
-          ) : null}
-          {/* Link to full model picker */}
-          <div className="border-t border-border px-2 py-1.5">
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                className="flex flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-                onClick={() => {
-                  onOpenChange(false);
-                  setSearch("");
-                  window.dispatchEvent(new CustomEvent(openModelPickerEvent, sessionId ? { detail: { sessionId } } : undefined));
-                }}
-              >
-                <Settings2 className="size-3.5" />
-                All models
-              </button>
-              {showOpenWorkModelsPromo ? (
-                <button
-                  type="button"
-                  className="shrink-0 rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-                  onClick={handleHideOpenWorkModels}
-                >
-                  Hide
-                </button>
-              ) : null}
-            </div>
-          </div>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
+  });
+  const openProvider = () => { setQuery(""); setEffort(false); onOpenChange(false); window.dispatchEvent(new Event(openProviderAuthEvent)); };
+  const openSettings = () => { onOpenChange(false); openAutoProviderSettings(); };
+  return <Popover open={open} onOpenChange={(next) => {
+    // A provider sign-in opened from this picker owns focus until it finishes or is cancelled.
+    if (!next && choice.loginOpen) return;
+    setQuery(""); setEffort(false); setFocusAlternative(false); onOpenChange(next);
+  }}>
+    <PopoverTrigger type="button" disabled={disabled} aria-label="Change model"
+      className="inline-flex h-9 min-w-0 items-center gap-1.5 px-2.5 text-sm text-muted-foreground hover:text-foreground focus-visible:rounded focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50">
+      <span className="max-w-56 truncate">{hideValue ? "Select model" : isAutoModel(value) ? "Auto" : catalog.currentOption ? modelTitle(catalog.currentOption) : "Select model"}{!hideValue && summary ? ` · ${summary}` : ""}{!hideValue && fastOn ? <span data-testid="model-fast-indicator" className="text-xs font-medium"> · Fast</span> : null}</span><ChevronDown className="size-3" />
+    </PopoverTrigger>
+    <PopoverContent ref={popupRef} tabIndex={-1} align="start" initialFocus={() => isMobile || focusAlternative ? popupRef.current : searchInputRef.current} data-testid="composer-model-picker" className="flex max-h-[min(var(--available-height),36rem)] w-90 max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-2xl p-0">
+      {effort && selected ? <div data-slot="model-thinking-submenu" className="overflow-y-auto p-2">
+        <button ref={backButtonRef} type="button" aria-label="Back to models" className="flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring" onClick={() => setEffort(false)}>
+          <ChevronLeft className="size-4 shrink-0 text-muted-foreground" />
+          <span className="min-w-0"><span className="block truncate text-sm font-medium">Effort</span><span className="block truncate text-xs text-muted-foreground">{selected.title}</span></span>
+        </button>
+        <p role="status" className="px-2 py-2 text-xs text-muted-foreground">{getModelBehaviorSelection(selectedBehavior.options, controls.fast ? controls.toggleValue ?? null : behaviorValue).description}</p>
+        {controls.options.map((option) => <Button key={option.value ?? "default"} variant="ghost" className="h-11 w-full justify-between" aria-pressed={option.value === behaviorValue} onClick={() => { onBehaviorChange?.(option.value); setEffort(false); }}>
+          {option.label}{option.value === behaviorValue ? <Check className="size-4" /> : null}
+        </Button>)}
+      </div> : <ModelPickerList searchInputRef={searchInputRef} autoFocusSearch={false} options={options} current={value} query={query} onQueryChange={setQuery} onSelect={select}
+        focusAlternative={focusAlternative} catalogState={catalogState} retainedSelection={retainedSelection} onConnectProvider={!restrictToCloud ? openProvider : undefined}
+        onOpenProviderSettings={!checkRestriction({ restriction: "allowControlSettings" }) ? openSettings : undefined}
+        onSetWorkspaceDefault={onSetWorkspaceDefault ?? setWorkspaceDefault} currentBehaviorValue={behaviorValue} openWorkModelsSyncing={autoVisible && openWorkModelsSyncing} onReloadWorkspace={onReloadWorkspace} onRetryAuto={catalogState.onRetry} footer={<>
+        <div className="border-t border-border px-2 py-1" data-testid="model-behavior-rows">
+          <button ref={effortButtonRef} type="button" data-testid="model-effort" disabled={!canChangeEffort} onClick={() => setEffort(true)}
+            className="flex h-10 w-full cursor-pointer items-center gap-3 rounded-md px-2 text-left text-sm hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default disabled:hover:bg-transparent">
+            <span className="min-w-0 flex-1 font-medium">Effort</span>
+            <span className="max-w-32 truncate text-muted-foreground">{effortValueLabel}</span>
+            <kbd className="hidden shrink-0 rounded border border-border/70 bg-muted/40 px-1.5 py-0.5 font-sans text-[10px] leading-none text-muted-foreground sm:inline-flex">{effortShortcutLabel}</kbd>
+            <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
+          </button>
+          {selected && onBehaviorChange && !autoSelected && controls.hasFast ? <div className="flex h-10 items-center gap-3 px-2 text-sm" title={FAST_PRICING_WARNING}>
+            <span className="min-w-0 flex-1 font-medium">Fast mode</span>
+            <kbd className="hidden shrink-0 rounded border border-border/70 bg-muted/40 px-1.5 py-0.5 font-sans text-[10px] leading-none text-muted-foreground sm:inline-flex">{fastShortcutLabel}</kbd>
+            <Switch aria-label="Fast mode" size="sm" checked={controls.fast} disabled={controls.toggleValue === undefined} onCheckedChange={() => { if (controls.toggleValue !== undefined) onBehaviorChange(controls.toggleValue); }} />
+          </div> : null}
+        </div>
+        <div className="flex items-center justify-between border-t border-border px-2 py-1">
+          {!restrictToCloud ? <Button variant="ghost" size="sm" className="h-9 font-normal text-muted-foreground" onClick={openProvider}>Connect more providers</Button> : <span />}
+          <Button variant="ghost" size="sm" className="h-9 font-normal text-muted-foreground" onClick={() => { onOpenChange(false); window.dispatchEvent(new CustomEvent(openModelPickerEvent, { detail: { sessionId } })); }}>All models</Button>
+        </div>
+        <AutoAccessFooter available={autoVisible} syncing={autoVisible && openWorkModelsSyncing} />
+      </>} />}
+    </PopoverContent>
+  </Popover>;
 }

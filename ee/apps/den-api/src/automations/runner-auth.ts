@@ -1,13 +1,15 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 import {
-  AUTOMATION_MODEL_ATTENTION_CAPABILITY,
+  AUTOMATION_DESKTOP_RUNNER_CAPABILITY_LIMIT,
+  automationDesktopRunnerCapabilitySchema,
   type AutomationDesktopRunnerCapability,
 } from "@openwork/types/automations"
+import { z } from "zod"
 import { env } from "../env.js"
 import { firstForwardedValue, publicRequestUrl, trustedForwardedOrigin } from "../request-url.js"
 
 const TOKEN_TTL_MS = 12 * 60 * 60_000
-const TOKEN_ROUTE_SUFFIX = "/v1/automation-runners/token"
+const TOKEN_ROUTE_SUFFIXES = ["/v1/automation-runners/token", "/v1/session-runners/token"]
 const DEN_WEB_PROXY_PREFIX = "/api/den"
 
 export type AutomationRunnerIdentity = {
@@ -33,10 +35,11 @@ function normalizeRunnerAudience(value: string): string | null {
 
 export function automationRunnerAudienceFromRequestUrl(requestUrl: string): string {
   const parsed = new URL(requestUrl)
-  if (!["http:", "https:"].includes(parsed.protocol) || !parsed.pathname.endsWith(TOKEN_ROUTE_SUFFIX)) {
+  const suffix = TOKEN_ROUTE_SUFFIXES.find((candidate) => parsed.pathname.endsWith(candidate))
+  if (!["http:", "https:"].includes(parsed.protocol) || !suffix) {
     throw new Error("automation_runner_audience_invalid")
   }
-  parsed.pathname = parsed.pathname.slice(0, -TOKEN_ROUTE_SUFFIX.length) || "/"
+  parsed.pathname = parsed.pathname.slice(0, -suffix.length) || "/"
   parsed.search = ""
   parsed.hash = ""
   const audience = normalizeRunnerAudience(parsed.toString())
@@ -108,13 +111,8 @@ export class AutomationRunnerAuth {
       const audience = decoded.v === 2 && typeof decoded.a === "string"
         ? normalizeRunnerAudience(decoded.a)
         : null
-      const capabilities = decoded.c === undefined
-        ? []
-        : Array.isArray(decoded.c)
-            && decoded.c.length <= 1
-            && decoded.c.every((capability) => capability === AUTOMATION_MODEL_ATTENTION_CAPABILITY)
-          ? decoded.c as AutomationDesktopRunnerCapability[]
-          : null
+      const parsedCapabilities = z.array(automationDesktopRunnerCapabilitySchema).max(AUTOMATION_DESKTOP_RUNNER_CAPABILITY_LIMIT).safeParse(decoded.c ?? [])
+      const capabilities = parsedCapabilities.success ? parsedCapabilities.data : null
       if (
         (decoded.v !== 1 && decoded.v !== 2)
         || typeof decoded.o !== "string"

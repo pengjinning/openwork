@@ -38,6 +38,7 @@ import {
   exchangeHandoffAndSignIn,
 } from "@/app/lib/den-handoff";
 import { denSettingsChangedEvent } from "@/app/lib/den-session-events";
+import { parseManualAuthInput } from "@/app/lib/manual-auth-input";
 import { clearOrgSelectionPending, readOrgSelectionPending } from "@/app/lib/den-sign-in-intent";
 import { usePlatform } from "../../kernel/platform";
 import { useBootState } from "../../shell/boot-state";
@@ -138,7 +139,11 @@ async function stageOnboardingUpdate(
   if (
     channelState.channel === "alpha" &&
     update.latestVersion &&
-    !(await isAlphaUpdateAllowed(update.latestVersion, desktopConfig))
+    !(await isAlphaUpdateAllowed(
+      update.latestVersion,
+      desktopConfig,
+      channelState.currentVersion,
+    ))
   ) {
     return false;
   }
@@ -195,6 +200,7 @@ function useDenClient() {
  */
 type PreparedBootstrapSummary = {
   orgName: string;
+  skillTitle: string;
   claimLinks: Array<{ id: string; role: string; url: string; expiresAt: string }>;
 };
 
@@ -212,6 +218,7 @@ function usePreparedBootstrap() {
     if (!bootstrap.prepared?.skillTitle) return null;
     return {
       orgName: bootstrap.prepared.orgName || "Your workspace",
+      skillTitle: bootstrap.prepared.skillTitle,
       claimLinks: bootstrap.claimLinks ?? [],
     };
   }, [bootstrap]);
@@ -219,6 +226,7 @@ function usePreparedBootstrap() {
 
 function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummary }) {
   const platform = usePlatform();
+  const navigate = useNavigate();
   const ownerClaim = prepared.claimLinks.find((link) => link.role === "owner") ?? null;
   const [showSignInCode, setShowSignInCode] = useState(false);
   const [signInCode, setSignInCode] = useState("");
@@ -226,9 +234,11 @@ function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummar
   const [signInError, setSignInError] = useState<string | null>(null);
 
   const submitSignInCode = useCallback(async () => {
-    const grant = signInCode.trim();
-    if (grant.length < 12 || signInBusy) {
-      if (grant.length < 12) setSignInError("Paste a valid one-time sign-in code.");
+    // The claim page hands over a full `openwork://den-auth?grant=…` link;
+    // accept that as well as a bare code, like the main sign-in page does.
+    const parsed = parseManualAuthInput(signInCode);
+    if (!parsed || signInBusy) {
+      if (!parsed) setSignInError("Paste a valid one-time sign-in code.");
       return;
     }
 
@@ -237,9 +247,8 @@ function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummar
     setSignInError(null);
 
     try {
-      const result = await exchangeHandoffAndSignIn(grant, {
+      const result = await exchangeHandoffAndSignIn(parsed.grant, {
         baseUrl: settings.baseUrl,
-        client: createDenClient({ baseUrl: settings.baseUrl }),
         // A pasted one-time code is a desktop-initiated sign-in.
         desktopInitiated: true,
       });
@@ -265,6 +274,21 @@ function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummar
           </div>
           <PageTitle>{prepared.orgName}</PageTitle>
         </PageHeader>
+
+        <PageContent>
+          <div className="mx-auto grid w-full max-w-md gap-3">
+            <div
+              data-openwork-prepared-skill="true"
+              className="flex min-h-10 items-center justify-between gap-3 border-y border-dls-border py-2 text-sm"
+            >
+              <span className="text-muted-foreground">First skill ready</span>
+              <span className="flex min-w-0 items-center gap-1.5 font-medium text-foreground">
+                <Check className="size-4 shrink-0 text-green-11" />
+                <span className="truncate">{prepared.skillTitle}</span>
+              </span>
+            </div>
+          </div>
+        </PageContent>
 
         {ownerClaim ? (
           <PageContent>
@@ -317,12 +341,23 @@ function PreparedWorkspacePage({ prepared }: { prepared: PreparedBootstrapSummar
             </div>
           </PageContent>
         ) : null}
+
+        <PageFooter>
+          <Button
+            type="button"
+            variant="link"
+            className="mx-auto"
+            onClick={() => navigate("/signin")}
+          >
+            Sign in with an existing account
+          </Button>
+        </PageFooter>
       </PageContainer>
     </Page>
   );
 }
 
-function markProvidersSeen(providers: DenOrgLlmProvider[]) {
+function markProvidersSeen(providers: ReadonlyArray<{ id: string }>) {
   if (providers.length === 0) return;
 
   try {
@@ -603,7 +638,7 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
     }
   }, [authToken, navigate, orgId]);
 
-  const { providers, marketplaces, loading, error } = useQueries({
+  const { providers, gatewayProviders, marketplaces, loading, error } = useQueries({
     queries: [
       {
         queryKey: ["den-org-onboarding", settings.baseUrl, orgId, "providers"],
@@ -611,16 +646,22 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
         queryFn: () => denClient.listOrgLlmProviders(orgId),
       },
       {
+        queryKey: ["den-org-onboarding", settings.baseUrl, orgId, "gateway-providers"],
+        enabled: Boolean(authToken && orgId),
+        queryFn: () => denClient.listOrgGatewayProviders(orgId),
+      },
+      {
         queryKey: ["den-org-onboarding", settings.baseUrl, orgId, "marketplaces"],
         enabled: Boolean(authToken && orgId),
         queryFn: () => denClient.listOrgMarketplaces(orgId),
       },
     ],
-    combine: ([providersQuery, marketplacesQuery]) => ({
+    combine: ([providersQuery, gatewayProvidersQuery, marketplacesQuery]) => ({
       providers: providersQuery.data ?? [],
+      gatewayProviders: gatewayProvidersQuery.data ?? [],
       marketplaces: marketplacesQuery.data ?? [],
-      loading: providersQuery.isPending || marketplacesQuery.isPending,
-      error: providersQuery.error?.message ?? marketplacesQuery.error?.message ?? null,
+      loading: providersQuery.isPending || gatewayProvidersQuery.isPending || marketplacesQuery.isPending,
+      error: providersQuery.error?.message ?? gatewayProvidersQuery.error?.message ?? marketplacesQuery.error?.message ?? null,
     }),
   });
 
@@ -634,17 +675,17 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
     }
     // Mark all providers shown on this page as "seen" so the global
     // toast doesn't re-fire for them on the next sync interval.
-    markProvidersSeen(providers);
+    markProvidersSeen([...providers, ...gatewayProviders]);
     try {
       window.sessionStorage.removeItem(DEN_HANDOFF_AUTO_CONTINUE_KEY);
     } catch {}
-    if (providers.length > 0 && optionsArg?.requestReload !== false) {
+    if ((providers.length > 0 || gatewayProviders.length > 0) && optionsArg?.requestReload !== false) {
       try {
         window.localStorage.setItem(RELOAD_AFTER_ONBOARDING_KEY, "1");
       } catch {}
     }
     navigate("/session", { replace: true });
-  }, [navigate, providers, selectedDefault]);
+  }, [gatewayProviders, navigate, providers, selectedDefault]);
 
   const handleContinue = useCallback(async (optionsArg?: { requestReload?: boolean }) => {
     if (!window.__OPENWORK_ELECTRON__?.shell?.relaunch) {
@@ -725,8 +766,10 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
     finishOnboarding();
   }, [brandingRestart, finishOnboarding]);
 
-  const totalModels = providers.reduce((sum, provider) => sum + provider.models.length, 0);
-  const hasResources = providers.length > 0 || marketplaces.length > 0;
+  const openworkProviders = providers.filter((provider) => provider.source === "openwork");
+  const legacyProviders = providers.filter((provider) => provider.source !== "openwork");
+  const totalModels = legacyProviders.reduce((sum, provider) => sum + provider.models.length, 0);
+  const hasResources = providers.length > 0 || gatewayProviders.length > 0 || marketplaces.length > 0;
   const autoContinuePending =
     autoContinue && !loading && !error && !brandingRestart;
 
@@ -862,7 +905,7 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
               <PageLoadingDescription>Loading available resources...</PageLoadingDescription>
             </PageLoading>
           </PageContent>
-        ) : !hasResources ? (
+        ) : error && !hasResources ? null : !hasResources ? (
           <PageContent>
             <Empty className="h-fit flex-none">
               <EmptyHeader>
@@ -890,15 +933,39 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
                   multiple
                   className="rounded-2xl border border-border bg-transparent shadow-none before:hidden"
                 >
-                  {/* AI Providers */}
-                  {providers.length > 0 ? (
+                  {openworkProviders.length > 0 ? (
+                    <Section
+                      icon={<CloudIcon className="size-5 text-foreground/60" />}
+                      title="OpenWork Models"
+                      description="Managed models available through your organization."
+                    >
+                      {openworkProviders.map((provider) => (
+                        <ProviderAccessCard key={provider.id} provider={provider} />
+                      ))}
+                    </Section>
+                  ) : null}
+
+                  {gatewayProviders.length > 0 ? (
+                    <Section
+                      icon={<CloudIcon className="size-5 text-foreground/60" />}
+                      title="AI Gateway"
+                      description="AI providers you have access to through your organization."
+                      count={`${gatewayProviders.length} AI provider${gatewayProviders.length === 1 ? "" : "s"}`}
+                    >
+                      {gatewayProviders.map((provider) => (
+                        <ProviderAccessCard key={provider.id} provider={provider} />
+                      ))}
+                    </Section>
+                  ) : null}
+
+                  {legacyProviders.length > 0 ? (
                     <Section
                       icon={<CloudIcon className="size-5 text-foreground/60" />}
                       title="AI Providers"
                       description="Models you can use in your workspace."
                       count={`${totalModels} model${totalModels === 1 ? "" : "s"}`}
                     >
-                      {providers.map((provider) => (
+                      {legacyProviders.map((provider) => (
                         <ProviderCard
                           key={provider.id}
                           provider={provider}
@@ -913,7 +980,7 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
                   {marketplaces.length > 0 ? (
                     <Section
                       icon={<Square3Stack3DIcon className="size-5 text-foreground/60" />}
-                      title="Marketplaces"
+                      title="Collections"
                       description="App stores with extensions and plugins for your workspace."
                       count={`${marketplaces.length} marketplace${marketplaces.length === 1 ? "" : "s"}`}
                     >
@@ -938,9 +1005,9 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
 
         <PageFooter>
           {/* Footer hint */}
-          {!loading && hasResources ? (
+          {!loading && !error && hasResources ? (
             <p className="text-center text-xs text-muted-foreground text-balance leading-relaxed tracking-wide">
-              Providers are added to your workspace automatically. Marketplaces are available from Cloud settings.
+              Available providers appear in AI Providers; some may require sign-in. Collections are available from Cloud settings.
             </p>
           ) : null}
           <Button
@@ -960,6 +1027,22 @@ export function ResourceSelectionPage({ autoContinue = false }: { autoContinue?:
         </PageFooter>
       </PageContainer>
     </Page>
+  );
+}
+
+function ProviderAccessCard({ provider }: { provider: Pick<DenOrgLlmProvider, "providerId" | "name"> }) {
+  return (
+    <div className="-mx-2 flex items-center gap-4.5 rounded-xl border border-border px-3 py-3">
+      <ProviderIcon
+        providerId={provider.providerId}
+        providerName={provider.name}
+        size={20}
+        className="text-foreground"
+      />
+      <div className="min-w-0 flex-1 text-sm font-medium text-foreground">
+        {provider.name}
+      </div>
+    </div>
   );
 }
 
@@ -993,7 +1076,7 @@ interface SectionProps {
   icon: React.ReactNode;
   title: string;
   description: string;
-  count: string;
+  count?: string;
   children: React.ReactNode;
 }
 
@@ -1006,14 +1089,14 @@ function Section({ icon, title, description, count, children }: SectionProps) {
         <div className="min-w-0 flex-1 flex flex-col gap-1">
           <h3 className="flex items-center gap-2 font-medium tracking-wide">
             {title}
-            <span className="text-muted-foreground text-xs uppercase">{count}</span>
+            {count ? <span className="text-muted-foreground text-xs uppercase">{count}</span> : null}
           </h3>
           <p className="text-sm font-normal normal-case tracking-normal text-muted-foreground">
             {description}
           </p>
         </div>
       </AccordionTrigger>
-      <AccordionContent className="space-y-2 pb-2">
+      <AccordionContent className="flex flex-col gap-2 pb-2">
         {children}
       </AccordionContent>
     </AccordionItem>

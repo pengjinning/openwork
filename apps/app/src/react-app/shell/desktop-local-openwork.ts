@@ -5,7 +5,11 @@ import {
   type EngineInfo,
   type OpenworkServerInfo,
 } from "../../app/lib/desktop";
-import { readOpenworkServerSettings, writeOpenworkServerSettings } from "../../app/lib/openwork-server";
+import {
+  readOpenworkServerSettings,
+  writeOpenworkServerSettings,
+  type OpenworkServerSettings,
+} from "../../app/lib/openwork-server";
 import { safeStringify } from "../../app/utils";
 import { recordInspectorEvent } from "../../app/lib/app-inspector";
 import type { BootPhaseId } from "./boot-state";
@@ -15,7 +19,7 @@ type LocalWorkspaceLike = {
   name?: string | null;
   displayNameResolved?: string | null;
   path?: string | null;
-  workspaceType?: "local" | "remote" | string | null;
+  workspaceType?: string | null;
 };
 
 type EnsureDesktopLocalOpenworkOptions = {
@@ -46,6 +50,16 @@ export function isReadyLocalOpenworkServerInfo(
 
 export const LOCAL_OPENWORK_READINESS_MAX_ATTEMPTS = 20;
 export const LOCAL_OPENWORK_READINESS_RETRY_DELAY_MS = 500;
+
+export function openworkServerSettingsChanged(
+  previous: OpenworkServerSettings,
+  next: OpenworkServerSettings,
+): boolean {
+  return previous.urlOverride !== next.urlOverride
+    || previous.portOverride !== next.portOverride
+    || previous.token !== next.token
+    || previous.hostToken !== next.hostToken;
+}
 
 /**
  * Poll the local server bridge until it reports a ready server. A restart
@@ -141,12 +155,13 @@ export async function ensureDesktopLocalOpenworkConnection(
 
   try {
     const engine = await engineInfo().catch(() => null) as EngineInfo | null;
+    let startedEngine = false;
     if (!engine?.running || !engine.baseUrl) {
       await engineStart(workspaceRoot, {
         runtime: "direct",
         workspacePaths,
-        openworkRemoteAccess: readOpenworkServerSettings().remoteAccessEnabled === true,
       });
+      startedEngine = true;
     }
 
     // The server publishes its base URL and tokens asynchronously after a
@@ -157,14 +172,16 @@ export async function ensureDesktopLocalOpenworkConnection(
       throw new Error("OpenWork server did not become ready after activation.");
     }
 
-    writeOpenworkServerSettings({
+    const previousSettings = readOpenworkServerSettings();
+    const nextSettings = writeOpenworkServerSettings({
       urlOverride: info.baseUrl,
       token: info.ownerToken?.trim() || info.clientToken?.trim() || undefined,
       hostToken: info.hostToken?.trim() || undefined,
       portOverride: info.port ?? undefined,
-      remoteAccessEnabled: info.remoteAccessEnabled === true,
     });
-    emitOpenworkSettingsChanged();
+    if (startedEngine || openworkServerSettingsChanged(previousSettings, nextSettings)) {
+      emitOpenworkSettingsChanged();
+    }
 
     recordInspectorEvent("route.local_openwork.ensure.success", {
       route: options.route,

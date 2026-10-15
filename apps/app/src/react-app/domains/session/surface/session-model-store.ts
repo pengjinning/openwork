@@ -6,7 +6,7 @@
 import { useMemo } from "react";
 import { create } from "zustand";
 
-import { formatGenericBehaviorLabel, getModelBehaviorSummary } from "@/app/lib/model-behavior";
+import { getModelBehaviorSummary } from "@/app/lib/model-behavior";
 import type { ModelRef } from "@/app/types";
 
 type BehaviorOption = { value: string | null; label: string };
@@ -120,7 +120,7 @@ export type SessionModelControls = {
   modelVariantLabel: string;
   modelBehaviorOptions: BehaviorOption[] | undefined;
   hasSessionOverride: boolean;
-  setModel: (model: ModelRef) => void;
+  setModel: (model: ModelRef, variant?: string | null) => void;
   setVariant: (value: string | null) => void;
 };
 
@@ -143,7 +143,8 @@ export function useSessionModelSelection(input: UseSessionModelSelectionInput): 
   const selection = useSessionModelStore((state) => state.bySessionId[sessionId] ?? null);
 
   return useMemo(() => {
-    const setModel = (model: ModelRef) => useSessionModelStore.getState().setModel(sessionId, model);
+    const setModel = (model: ModelRef, variant?: string | null) =>
+      useSessionModelStore.getState().setModel(sessionId, model, variant);
     if (!selection) {
       return {
         selectedModel: fallbackModel,
@@ -157,15 +158,13 @@ export function useSessionModelSelection(input: UseSessionModelSelectionInput): 
       };
     }
     const providerModel = providerCatalog?.[selection.model.providerID]?.[selection.model.modelID];
-    const summary = providerModel
-      ? getModelBehaviorSummary(selection.model.providerID, providerModel, selection.variant)
-      : null;
+    const summary = getModelBehaviorSummary(selection.model.providerID, providerModel, selection.variant);
     return {
       selectedModel: selection.model,
       modelLabel: providerModel?.name || resolveModelDisplayName(selection.model.modelID),
-      modelVariant: summary ? summary.value : selection.variant,
-      modelVariantLabel: summary?.label ?? formatGenericBehaviorLabel(selection.variant),
-      modelBehaviorOptions: summary?.options ?? [],
+      modelVariant: summary.value,
+      modelVariantLabel: summary.label,
+      modelBehaviorOptions: summary.options,
       hasSessionOverride: true,
       setModel,
       setVariant: (value: string | null) => useSessionModelStore.getState().setVariant(sessionId, value),

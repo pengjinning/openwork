@@ -1,13 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, cpSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { prepareServerConstants } from "./prepare-server-constants.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = resolve(__dirname, "..");
 const repoRoot = resolve(desktopRoot, "../..");
 const electronSidecarDir = resolve(desktopRoot, "resources", "sidecars");
-const electronHelperDir = resolve(desktopRoot, "resources", "helpers");
 const electronRoot = resolve(desktopRoot, "electron");
 const packagedServerRoot = resolve(desktopRoot, "server");
 const packagedRuntimeRoot = resolve(desktopRoot, ".electron-runtime", "node_modules");
@@ -46,31 +46,32 @@ function writeSentryBuildConfig() {
 }
 
 run(nodeCmd, [resolve(__dirname, "prepare-sidecar.mjs"), "--force", "--outdir", electronSidecarDir], desktopRoot);
-run(nodeCmd, [resolve(__dirname, "prepare-computer-use-helper.mjs"), "--force", "--outdir", electronHelperDir], desktopRoot);
+// Build before staging: the runtime copy must contain this checkout's ESM.
+run(pnpmCmd, ["--filter", "@openwork/remote-sessions", "build"], repoRoot);
 run(nodeCmd, [resolve(__dirname, "prepare-runtime-node-modules.mjs"), "--outdir", packagedRuntimeRoot], desktopRoot);
 writeSentryBuildConfig();
+// Records an explicit build-time Auto opt-out, if any.
+run(nodeCmd, [resolve(__dirname, "prepare-desktop-free-release.mjs")], desktopRoot);
+// The packaged server imports @openwork/free-auto, which plain node loads from its dist build.
+run(pnpmCmd, ["--filter", "@openwork/free-auto", "build"], repoRoot);
 // Build the server TS → JS so Electron can import it in-process
-run(pnpmCmd, ["--filter", "openwork-server", "build"], repoRoot);
+// CI already compiles this exact checkout in the required build job.
+if (!process.argv.includes("--server-built")) {
+  run(pnpmCmd, ["--filter", "openwork-server", "build"], repoRoot);
+}
+// automation-runner.mjs imports @openwork/headless-threads through its
+// published "default" export (dist/index.js); build it so plain-node
+// consumers resolve it in packaged layouts.
+run(pnpmCmd, ["--filter", "@openwork/headless-threads", "build"], repoRoot);
 // OPENWORK_ELECTRON_BUILD tells Vite to emit relative asset paths so
 // index.html resolves /assets/* correctly when loaded via file:// from
 // inside the packaged .app bundle.
 run(pnpmCmd, ["--filter", "@openwork/app", "build"], repoRoot, {
   OPENWORK_ELECTRON_BUILD: "1",
 });
-// Copy constants.json next to server dist so the packaged asar can resolve it.
-// Also patch the compiled import path so it works from both dev and packaged layouts.
+// Relocate repository constants for every compiled server module, including v2.
 const serverDistDir = resolve(repoRoot, "apps", "server", "dist");
-const constantsSrc = resolve(repoRoot, "constants.json");
-copyFileSync(constantsSrc, resolve(serverDistDir, "constants.json"));
-const serverJsPath = resolve(serverDistDir, "server.js");
-const serverJsSrc = readFileSync(serverJsPath, "utf8");
-const patched = serverJsSrc.replace(
-  /from\s+["']\.\.\/\.\.\/\.\.\/constants\.json["']/,
-  'from "./constants.json"',
-);
-if (patched !== serverJsSrc) {
-  writeFileSync(serverJsPath, patched, "utf8");
-}
+prepareServerConstants(serverDistDir, resolve(repoRoot, "constants.json"));
 rmSync(packagedServerRoot, { recursive: true, force: true });
 cpSync(serverDistDir, resolve(packagedServerRoot, "dist"), { recursive: true });
 copyFileSync(resolve(repoRoot, "apps", "server", "package.json"), resolve(packagedServerRoot, "package.json"));

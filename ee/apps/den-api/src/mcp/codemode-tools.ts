@@ -1,4 +1,5 @@
 import { Tool, toolError } from "@openwork/codemode"
+import type { CapabilityUsageSource } from "@openwork-ee/den-db/schema"
 import { normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { Effect } from "effect"
 import type { Hono } from "hono"
@@ -20,6 +21,7 @@ import {
   buildExternalCapabilityName,
   executeExternalCapability,
   EXTERNAL_MCP_SEARCH_CONCURRENCY,
+  providerMarksReadOnly,
   type McpMemberIdentity,
 } from "./external-capabilities.js"
 import { invokeMcpOperation, normalizeToolBody, normalizeToolRecord } from "./invoke.js"
@@ -53,6 +55,20 @@ export type BuiltCodemodeTools = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+export function stripUndefinedEntries(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return Array.from(value, (entry) => entry === undefined ? null : stripUndefinedEntries(entry))
+  }
+  if (!isRecord(value)) return value
+  const prototype = Object.getPrototypeOf(value)
+  if (prototype !== Object.prototype && prototype !== null) return value
+  const stripped: Record<string, unknown> = {}
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry !== undefined) stripped[key] = stripUndefinedEntries(entry)
+  }
+  return stripped
 }
 
 function isCodemodeJsonSchema(value: unknown): value is Tool.JsonSchema {
@@ -95,32 +111,15 @@ export function restrictCodemodeToolTree(input: {
   }
 }
 
-/**
- * Unattended Cloud runs may be retried after a lost lease, so Phase 1 admits
- * only read-only capabilities implemented by Den itself. External MCP tools
- * remain available to interactive saved-Script runs, but provider metadata is
- * not an authority boundary for unattended execution.
- */
-export function firstUnattendedUnsafeCapability(
-  built: BuiltCodemodeTools,
-  requiredCapabilities: readonly CodemodeManifestEntry[],
-): CodemodeManifestEntry | null {
-  const manifest = new Map(built.manifest.map((entry) => [
-    `${entry.scriptPath}\n${entry.capabilityName}`,
-    entry,
-  ]))
-  return requiredCapabilities.find((required) => {
-    const available = manifest.get(`${required.scriptPath}\n${required.capabilityName}`)
-    return available?.authority !== "den" || available.readOnly !== true
-  }) ?? null
-}
-
 function textParts(value: unknown): string[] {
   if (!isRecord(value) || !Array.isArray(value.content)) return []
   return value.content.flatMap((part) => isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [])
 }
 
 function toolResultValue(value: unknown): unknown {
+  // Den routes attach their untruncated payload for scripts; the model-visible
+  // `content` is capped per string and would silently cut long files.
+  if (isRecord(value) && "payload" in value) return value.payload
   if (isRecord(value) && value.structuredContent !== undefined) return value.structuredContent
   const text = textParts(value)
   if (text.length === 0) return null
@@ -155,11 +154,13 @@ export function buildDenCatalogToolTree(input: {
   const definitions = operations.map((operation) => [operation.name, Tool.make({
     description: operation.operation.summary ?? operation.operation.description ?? operation.name,
     input: denInputJsonSchema(operation),
+    output: operation.outputSchema,
     run: (toolInput) => Effect.promise(() => invokeMcpOperation({
       app: input.app,
       env: input.env,
       operation,
       principal: input.principal,
+      includePayload: true,
       toolInput: {
         path: normalizeToolRecord(isRecord(toolInput) ? toolInput.path : undefined),
         query: normalizeToolRecord(isRecord(toolInput) ? toolInput.query : undefined),
@@ -211,6 +212,8 @@ export async function buildNativeProviderToolTree(input: {
   organizationId: string
   member: McpMemberIdentity | null
   namespaceContext?: CodemodeConnectionNamespaceContext
+  /** What starts these calls, recorded with each Library usage event. */
+  usageSource: CapabilityUsageSource
 }): Promise<BuiltCodemodeTools> {
   if (!input.member) return { tools: {}, manifest: [] }
   const memberIdentity = input.member
@@ -219,12 +222,14 @@ export async function buildNativeProviderToolTree(input: {
     member: memberIdentity,
   })
   const organizationId = normalizeDenTypeId("organization", input.organizationId)
+  const catalog = input.catalog
   const namespaceEntries = namespaceContext.codemodeNativeProviderEntries.flatMap((connection) => {
     const namespace = namespaceContext.namespaces.native.get(connection.id)
     if (!namespace) return []
-    const definitions = nativeOperations(input.catalog, connection.nativeProviderKey).map((operation) => [operation.name, Tool.make({
+    const definitions = nativeOperations(catalog, connection.nativeProviderKey).map((operation) => [operation.name, Tool.make({
       description: operation.operation.summary ?? operation.operation.description ?? operation.name,
       input: denInputJsonSchema(operation),
+      output: operation.outputSchema,
       run: (toolInput) => Effect.promise(() => executeNativeCapability({
         app: input.app,
         env: input.env,
@@ -233,9 +238,11 @@ export async function buildNativeProviderToolTree(input: {
         member: memberIdentity,
         catalog: input.catalog,
         principal: input.principal,
+        includePayload: true,
         path: normalizeToolRecord(isRecord(toolInput) ? toolInput.path : undefined),
         query: normalizeToolRecord(isRecord(toolInput) ? toolInput.query : undefined),
         body: normalizeToolBody(isRecord(toolInput) ? toolInput.body : undefined),
+        usageSource: input.usageSource,
       })).pipe(Effect.flatMap((result) => !result || result.isError
         ? Effect.fail(toolError(toolResultError(result)))
         : Effect.succeed(toolResultValue(result)))),
@@ -247,7 +254,7 @@ export async function buildNativeProviderToolTree(input: {
     tools: Object.fromEntries(namespaceEntries),
     manifest: buildNativeProviderManifest({
       connections: namespaceContext.codemodeNativeProviderEntries,
-      catalog: input.catalog,
+      catalog,
       namespaces: namespaceContext.namespaces.native,
     }),
   }
@@ -285,8 +292,11 @@ function isListedExternalConnection(value: ListedExternalConnection | undefined)
 export async function buildExternalMcpToolTree(input: {
   organizationId: string
   member: McpMemberIdentity | null
+  scopes: ReadonlySet<string>
   redirectUriBase: string
   namespaceContext?: CodemodeConnectionNamespaceContext
+  /** What starts these calls, recorded with each Library usage event. */
+  usageSource: CapabilityUsageSource
 }): Promise<BuiltCodemodeTools> {
   if (!input.member) return { tools: {}, manifest: [] }
   const memberIdentity = input.member
@@ -324,10 +334,12 @@ export async function buildExternalMcpToolTree(input: {
       run: (args) => Effect.promise(() => executeExternalCapability({
         organizationId: input.organizationId,
         member: memberIdentity,
+        scopes: input.scopes,
         connectionId: connection.id,
         toolName: tool.name,
-        args,
+        args: stripUndefinedEntries(args),
         redirectUriBase: input.redirectUriBase,
+        usageSource: input.usageSource,
       })).pipe(Effect.flatMap((result) => result.ok
         ? Effect.succeed(toolResultValue(result.result))
         : Effect.fail(toolError(result.message)))),
@@ -344,7 +356,8 @@ export async function buildExternalMcpToolTree(input: {
         .map((tool) => ({
           scriptPath: codemodeScriptPath(namespace, tool.name),
           capabilityName: buildExternalCapabilityName(connection.id, tool.name),
-          readOnly: tool.annotations?.readOnlyHint === true,
+          // Descriptive only: external dispatch always requires the caller's write scope.
+          readOnly: providerMarksReadOnly(tool.annotations),
           authority: "external" as const,
         }))
     }),

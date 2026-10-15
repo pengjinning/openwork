@@ -8,7 +8,9 @@ const EnvSchema = z.object({
   DEN_GATEWAY_VERSION: z.string().optional(),
   RENDER_GIT_COMMIT: z.string().optional(),
   DEN_GATEWAY_WEB_ROOT: z.string().optional(),
+  DEN_GATEWAY_DEN_WEB_URL: z.string().optional(),
   DEN_GATEWAY_RESOLVE_TTL_MS: z.string().optional(),
+  DEN_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_MS: z.string().optional(),
   DEN_GATEWAY_LOG_REQUESTS: z.string().optional(),
 })
 
@@ -55,6 +57,11 @@ function normalizeHttpBaseUrl(envName: string, value: string) {
   return value.replace(/\/+$/, "")
 }
 
+function optionalHttpBaseUrl(envName: string, value: string | undefined) {
+  const trimmed = optionalString(value)
+  return trimmed ? normalizeHttpBaseUrl(envName, trimmed) : undefined
+}
+
 function parseBoolean(value: string | undefined, fallback: boolean) {
   const normalized = value?.trim().toLowerCase()
   if (!normalized) {
@@ -78,6 +85,14 @@ export const env = {
     renderGitCommit: parsed.RENDER_GIT_COMMIT,
   }),
   webRoot: optionalString(parsed.DEN_GATEWAY_WEB_ROOT),
+  // Self-hosted: the Den web origin the served app signs in with. Unset keeps
+  // the app's build-time default (hosted OpenWork Cloud).
+  denWebUrl: optionalHttpBaseUrl("DEN_GATEWAY_DEN_WEB_URL", parsed.DEN_GATEWAY_DEN_WEB_URL),
   resolveTtlMs: parsePositiveInteger("DEN_GATEWAY_RESOLVE_TTL_MS", parsed.DEN_GATEWAY_RESOLVE_TTL_MS, 15_000),
+  upstreamConnectTimeoutMs: parsePositiveInteger(
+    "DEN_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_MS",
+    parsed.DEN_GATEWAY_UPSTREAM_CONNECT_TIMEOUT_MS,
+    3_000,
+  ),
   logRequests: parseBoolean(parsed.DEN_GATEWAY_LOG_REQUESTS, true),
 }

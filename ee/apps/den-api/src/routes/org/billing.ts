@@ -1,22 +1,49 @@
 import type { Hono } from "hono"
 import { describeRoute } from "hono-openapi"
 import { z } from "zod"
-import { getCloudWorkerBillingStatus } from "../../billing/polar.js"
-import { createInferenceCheckoutSession, createInferencePortalSession, createSeatCheckoutSession, getOrgBillingSummary, syncSeatCheckoutSession } from "../../stripe-billing.js"
-import { orgRoleRoute } from "../../middleware/index.js"
+import { ManagedModelsPolicyError } from "@openwork/types/den/managed-models-policy"
+import { createInferenceCheckoutSession, createInferencePortalSession, createOpenWorkWebCheckout, createSeatCheckoutSession, getOpenWorkWebBillingSummary, getOrgBillingSummary, syncStripeCheckoutSession } from "../../stripe-billing.js"
+import { orgMemberRoute, orgPermissionRoute } from "../../middleware/index.js"
 import { forbiddenSchema, jsonResponse, unauthorizedSchema } from "../../openapi.js"
 import { getRequiredUserEmail } from "../../user.js"
 import { env } from "../../env.js"
-import { ORGANIZATION_SUPER_ADMIN_ROLE, organizationRoleValueSatisfies } from "../../organization-role-hierarchy.js"
+import { isOpenWorkWebAvailableForOrganization } from "../../openwork-web-availability.js"
 import type { OrgRouteVariables } from "./shared.js"
-import { ensureOrganizationAdmin, ensureOrganizationSuperAdmin, orgAccessFailureStatus } from "./shared.js"
+import { orgAccessFailureStatus, permissionFailureHeaders, requirePermission } from "./shared.js"
+
+const INFERENCE_SUBSCRIPTION_EXISTS_PORTAL_REQUIRED_MESSAGE = "OpenWork Models is already subscribed for this organization. Updating its payment method needs the “Open the billing portal” permission, so ask someone who has it, such as the owner."
 
 const stripeBillingResponseSchema = z.object({}).passthrough().meta({ ref: "OrgStripeBillingResponse" })
-const stripeCheckoutRequestSchema = z.object({ type: z.enum(["inference", "seat"]).optional() })
+const stripeCheckoutRequestSchema = z.object({ type: z.enum(["inference", "seat", "web"]).optional() })
 const stripeCheckoutResponseSchema = z.object({ url: z.string() }).meta({ ref: "OrgStripeCheckoutResponse" })
 const stripeCheckoutSyncRequestSchema = z.object({ sessionId: z.string().trim().min(1) })
 const stripeCheckoutSyncResponseSchema = z.object({ synced: z.boolean() }).meta({ ref: "OrgStripeCheckoutSyncResponse" })
 const stripePortalResponseSchema = z.object({ url: z.string() }).meta({ ref: "OrgStripePortalResponse" })
+const managedModelsPolicyErrorSchema = z.object({
+  error: z.enum(["managed_models_disabled_for_dpa", "managed_models_policy_unavailable"]),
+  message: z.string(),
+})
+const openWorkWebUnavailableSchema = z.object({
+  error: z.literal("openwork_web_not_available"),
+  message: z.string(),
+}).meta({ ref: "OpenWorkWebUnavailableError" })
+
+const retiredPolarBillingStatus = {
+  featureGateEnabled: false,
+  hasActivePlan: true,
+  checkoutRequired: false,
+  portalUrl: null,
+  price: null,
+  subscription: null,
+  invoices: [],
+}
+
+function openWorkWebUnavailableResponse(): { error: "openwork_web_not_available"; message: string } {
+  return {
+    error: "openwork_web_not_available",
+    message: "OpenWork Web is not available for this organization.",
+  }
+}
 
 function getRequestOrigin(c: { req: { raw: Request } }) {
   const url = new URL(c.req.raw.url)
@@ -38,6 +65,24 @@ function checkoutSuccessUrl(c: { req: { raw: Request } }) {
   // where the unlocked value (the model lineup) is visible. The billing page
   // remains the status/portal view.
   return env.stripe.billingSuccessUrl ?? `${getRequestOrigin(c)}/dashboard/billing/stripe/checking?session_id={CHECKOUT_SESSION_ID}&return=models`
+}
+
+function openWorkWebCheckoutSuccessUrl(c: { req: { raw: Request } }) {
+  const fallback = `${getRequestOrigin(c)}/dashboard/billing/stripe/checking?session_id={CHECKOUT_SESSION_ID}&return=web`
+  const configured = env.stripe.billingSuccessUrl
+  if (!configured) {
+    return fallback
+  }
+  try {
+    const url = new URL(configured, getRequestOrigin(c))
+    url.pathname = "/dashboard/billing/stripe/checking"
+    url.searchParams.set("session_id", "{CHECKOUT_SESSION_ID}")
+    url.searchParams.set("return", "web")
+    url.hash = ""
+    return url.toString().replace("%7BCHECKOUT_SESSION_ID%7D", "{CHECKOUT_SESSION_ID}")
+  } catch {
+    return fallback
+  }
 }
 
 function appendSeatCheckoutParams(input: string) {
@@ -73,7 +118,45 @@ function checkoutCancelUrl(c: { req: { raw: Request } }) {
   return env.stripe.billingCancelUrl ?? billingReturnUrl(c)
 }
 
+function openWorkWebCheckoutCancelUrl(c: { req: { raw: Request } }) {
+  const configured = env.stripe.billingCancelUrl
+  try {
+    const url = new URL(configured ?? getRequestOrigin(c), getRequestOrigin(c))
+    url.pathname = "/dashboard/web"
+    url.search = ""
+    url.searchParams.set("stripe_checkout", "web")
+    url.searchParams.set("canceled", "1")
+    url.hash = ""
+    return url.toString()
+  } catch {
+    return `${getRequestOrigin(c)}/dashboard/web?stripe_checkout=web&canceled=1`
+  }
+}
+
 export function registerOrgBillingRoutes<T extends { Variables: OrgRouteVariables }>(app: Hono<T>) {
+  app.get(
+    "/v1/billing/web",
+    describeRoute({
+      tags: ["Organizations"],
+      hide: true,
+      summary: "Get OpenWork Web billing eligibility",
+      responses: {
+        200: jsonResponse("OpenWork Web billing eligibility returned successfully.", stripeBillingResponseSchema),
+        401: jsonResponse("The caller must be an organization member.", unauthorizedSchema),
+        404: jsonResponse("OpenWork Web is not available for this organization.", openWorkWebUnavailableSchema),
+      },
+    }),
+    orgMemberRoute(),
+    async (c) => {
+      const payload = c.get("organizationContext")
+      if (!isOpenWorkWebAvailableForOrganization(payload.organization.metadata)) {
+        return c.json(openWorkWebUnavailableResponse(), 404)
+      }
+      const web = await getOpenWorkWebBillingSummary(payload.organization.id)
+      return c.json({ billing: { stripe: { web } } })
+    },
+  )
+
   app.get(
     "/v1/billing",
     describeRoute({
@@ -85,31 +168,24 @@ export function registerOrgBillingRoutes<T extends { Variables: OrgRouteVariable
         401: jsonResponse("The caller must be signed in to read billing settings.", unauthorizedSchema),
       },
     }),
-    orgRoleRoute(["admin"]),
+    orgPermissionRoute("billing.view"),
     async (c) => {
       const user = c.get("user")
       const payload = c.get("organizationContext")
       const email = getRequiredUserEmail(user)
-      const canManageBilling = organizationRoleValueSatisfies({
-        roleValue: payload.currentMember.role,
-        requiredRole: ORGANIZATION_SUPER_ADMIN_ROLE,
-        isOwner: payload.currentMember.isOwner,
-      })
+      // The portal URL is a live Stripe session that can change billing, so it
+      // needs the same check as POST /v1/billing/stripe/portal (billing_portal.use,
+      // including the recent sign-in). Without it the URL is omitted; the read still succeeds.
+      const portal = await requirePermission(c, "billing_portal.use")
       const billing = await getOrgBillingSummary({
         organizationId: payload.organization.id,
-        includePortalUrl: canManageBilling,
+        includePortalUrl: portal.ok,
         returnUrl: billingReturnUrl(c),
       })
-      const polar = email
-        ? await getCloudWorkerBillingStatus({
-            userId: user.id,
-            email,
-            name: user.name ?? email,
-          }, {
-            includePortalUrl: canManageBilling,
-            includeInvoices: false,
-          }).catch(() => null)
-        : null
+      // Den web still reads `billing.polar` as the cloud-worker access summary
+      // (den-flow.ts getBillingSummary). Polar billing is retired, so this is
+      // the constant "no gate, access allowed" shape it always had in practice.
+      const polar = email ? retiredPolarBillingStatus : null
 
       return c.json({ billing: { ...billing, polar } })
     },
@@ -124,15 +200,13 @@ export function registerOrgBillingRoutes<T extends { Variables: OrgRouteVariable
       responses: {
         200: jsonResponse("Stripe Checkout session created successfully.", stripeCheckoutResponseSchema),
         401: jsonResponse("The caller must be signed in to start billing.", unauthorizedSchema),
-        403: jsonResponse("Only workspace owners and admins can start billing.", forbiddenSchema),
+        403: jsonResponse("Billing access is denied. When an OpenWork Models subscription already exists, the billing portal URL returned instead of a checkout needs the Open the billing portal permission and a recent sign-in.", z.union([forbiddenSchema, managedModelsPolicyErrorSchema])),
+        503: jsonResponse("Managed Models policy is unavailable.", managedModelsPolicyErrorSchema),
+        404: jsonResponse("OpenWork Web is not available for this organization.", openWorkWebUnavailableSchema),
       },
     }),
-    orgRoleRoute(["admin"]),
+    orgPermissionRoute("billing.manage"),
     async (c) => {
-      const permission = ensureOrganizationAdmin(c, "Only workspace owners and admins can start billing.")
-      if (!permission.ok) {
-        return c.json(permission.response, orgAccessFailureStatus(permission.response))
-      }
       const user = c.get("user")
       const email = getRequiredUserEmail(user)
       if (!email) {
@@ -145,15 +219,80 @@ export function registerOrgBillingRoutes<T extends { Variables: OrgRouteVariable
       }
       const payload = c.get("organizationContext")
       const subscriptionType = parsed.data.type ?? "inference"
-      const createCheckoutSession = subscriptionType === "seat" ? createSeatCheckoutSession : createInferenceCheckoutSession
+      if (subscriptionType === "web" && !isOpenWorkWebAvailableForOrganization(payload.organization.metadata)) {
+        return c.json(openWorkWebUnavailableResponse(), 404)
+      }
+      if (subscriptionType === "web") {
+        const webBilling = await getOpenWorkWebBillingSummary(payload.organization.id)
+        if (webBilling.complimentaryAccess) {
+          return c.json({
+            error: "openwork_web_complimentary_access_exists",
+            message: "OpenWork Web is already included for this organization without a Stripe subscription.",
+          }, 409)
+        }
+      }
+      const createCheckoutSession = subscriptionType === "seat"
+        ? createSeatCheckoutSession
+        : subscriptionType === "web"
+          ? createOpenWorkWebCheckout
+          : createInferenceCheckoutSession
       const session = await createCheckoutSession({
         organizationId: payload.organization.id,
         orgMemberId: payload.currentMember.id,
         email,
         name: user.name ?? email,
-        successUrl: subscriptionType === "seat" ? seatCheckoutSuccessUrl(c) : checkoutSuccessUrl(c),
-        cancelUrl: checkoutCancelUrl(c),
+        successUrl: subscriptionType === "seat"
+          ? seatCheckoutSuccessUrl(c)
+          : subscriptionType === "web"
+            ? openWorkWebCheckoutSuccessUrl(c)
+            : checkoutSuccessUrl(c),
+        cancelUrl: subscriptionType === "web" ? openWorkWebCheckoutCancelUrl(c) : checkoutCancelUrl(c),
+      }).catch((error) => {
+        if (error instanceof ManagedModelsPolicyError) return error
+        if (error instanceof Error && error.message === "stripe_openwork_web_subscription_exists") {
+          return "subscription_exists" as const
+        }
+        if (error instanceof Error && error.message === "stripe_inference_subscription_exists") {
+          return "inference_subscription_exists" as const
+        }
+        throw error
       })
+      if (session instanceof ManagedModelsPolicyError) {
+        return c.json({ error: session.code, message: session.message }, session.status)
+      }
+      if (session === "subscription_exists") {
+        return c.json({
+          error: "stripe_subscription_exists",
+          message: "OpenWork Web is already subscribed for this organization. Manage it from Billing.",
+        }, 409)
+      }
+      if (session === "inference_subscription_exists") {
+        // The organization already has an OpenWork Models subscription Stripe
+        // is still collecting on (typically past due after a failed renewal).
+        // A second Checkout would charge them twice, so hand them the billing
+        // portal where the payment method can be fixed instead. The portal URL
+        // is a live Stripe session that can change billing, so it needs the
+        // same check as POST /v1/billing/stripe/portal (billing_portal.use with
+        // a recent sign-in); Start a subscription alone never returns it.
+        const portalAccess = await requirePermission(c, "billing_portal.use")
+        if (!portalAccess.ok) {
+          const failure = portalAccess.response.error === "forbidden"
+            ? { ...portalAccess.response, message: INFERENCE_SUBSCRIPTION_EXISTS_PORTAL_REQUIRED_MESSAGE }
+            : portalAccess.response
+          return c.json(failure, orgAccessFailureStatus(failure), permissionFailureHeaders(failure))
+        }
+        const portal = await createInferencePortalSession({
+          organizationId: payload.organization.id,
+          returnUrl: billingReturnUrl(c),
+        }).catch(() => null)
+        if (portal?.url) {
+          return c.json({ url: portal.url })
+        }
+        return c.json({
+          error: "stripe_subscription_exists",
+          message: "OpenWork Models is already subscribed for this organization. Update the payment method from Billing.",
+        }, 409)
+      }
       return c.json({ url: session.url })
     },
   )
@@ -167,15 +306,11 @@ export function registerOrgBillingRoutes<T extends { Variables: OrgRouteVariable
       responses: {
         200: jsonResponse("Stripe billing portal session created successfully.", stripePortalResponseSchema),
         401: jsonResponse("The caller must be signed in to manage billing.", unauthorizedSchema),
-        403: jsonResponse("Only workspace owners and super-admins can manage billing.", forbiddenSchema),
+        403: jsonResponse("The caller needs the Open the billing portal permission and a recent sign-in.", forbiddenSchema),
       },
     }),
-    orgRoleRoute(["super-admin"]),
+    orgPermissionRoute("billing_portal.use"),
     async (c) => {
-      const permission = ensureOrganizationSuperAdmin(c, "Only workspace owners and super-admins can manage billing.")
-      if (!permission.ok) {
-        return c.json(permission.response, orgAccessFailureStatus(permission.response))
-      }
       const payload = c.get("organizationContext")
       const session = await createInferencePortalSession({
         organizationId: payload.organization.id,
@@ -194,30 +329,31 @@ export function registerOrgBillingRoutes<T extends { Variables: OrgRouteVariable
       responses: {
         200: jsonResponse("Stripe Checkout session synced successfully.", stripeCheckoutSyncResponseSchema),
         401: jsonResponse("The caller must be signed in to sync billing.", unauthorizedSchema),
-        403: jsonResponse("Only workspace owners and admins can sync billing.", forbiddenSchema),
+        403: jsonResponse("The caller needs the Start a subscription permission and a recent sign-in.", forbiddenSchema),
+        503: jsonResponse("Managed Models policy is unavailable.", managedModelsPolicyErrorSchema),
       },
     }),
-    orgRoleRoute(["admin"]),
+    orgPermissionRoute("billing.manage"),
     async (c) => {
-      const permission = ensureOrganizationAdmin(c, "Only workspace owners and admins can sync billing.")
-      if (!permission.ok) {
-        return c.json(permission.response, orgAccessFailureStatus(permission.response))
-      }
       const body = await c.req.json().catch(() => ({}))
       const parsed = stripeCheckoutSyncRequestSchema.safeParse(body)
       if (!parsed.success) {
         return c.json({ error: "invalid_request", details: parsed.error }, 400)
       }
       const payload = c.get("organizationContext")
-      const row = await syncSeatCheckoutSession({
+      const row = await syncStripeCheckoutSession({
         organizationId: payload.organization.id,
         sessionId: parsed.data.sessionId,
       }).catch((error) => {
+        if (error instanceof ManagedModelsPolicyError) return error
         if (error instanceof Error && (error.message === "stripe_checkout_session_org_mismatch" || error.message.includes("No such checkout.session"))) {
           return "org_mismatch"
         }
         throw error
       })
+      if (row instanceof ManagedModelsPolicyError) {
+        return c.json({ error: row.code, message: row.message }, row.status)
+      }
       if (row === "org_mismatch") {
         return c.json({ error: "stripe_checkout_session_not_found" }, 404)
       }

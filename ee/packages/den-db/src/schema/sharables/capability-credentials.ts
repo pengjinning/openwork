@@ -4,6 +4,7 @@ import {
   index,
   mysqlEnum,
   mysqlTable,
+  text,
   timestamp,
   uniqueIndex,
   varchar,
@@ -66,6 +67,15 @@ export const OrgOAuthClientTable = mysqlTable(
   ],
 )
 
+export type ExternalMcpReadinessCheck = {
+  status: "ready" | "could_not_verify"
+  checkedAt: string
+  lastSuccessfulAt: string | null
+  reason: string | null
+  /** Binds the probe to the configuration and credential it actually checked. Never returned. */
+  fingerprint: string
+}
+
 export const ConnectedAccountTable = mysqlTable(
   "connected_account",
   {
@@ -84,6 +94,7 @@ export const ConnectedAccountTable = mysqlTable(
     providerId: varchar("provider_id", { length: 255 }).notNull(),
     externalAccountId: varchar("external_account_id", { length: 255 }),
     scopes: compatJsonColumn<string[]>("scopes"),
+    /** OAuth access token, or an opaque personal MCP API key with tokenType="api_key" (never refreshed as OAuth). */
     accessToken: encryptedTextColumn("access_token"),
     refreshToken: encryptedTextColumn("refresh_token"),
     tokenType: varchar("token_type", { length: 64 }),
@@ -95,6 +106,9 @@ export const ConnectedAccountTable = mysqlTable(
      */
     pendingCodeVerifier: encryptedTextColumn("pending_code_verifier"),
     credentialHealth: compatJsonColumn<ExternalMcpCredentialHealth>("credential_health"),
+    readinessCheck: compatJsonColumn<ExternalMcpReadinessCheck>("readiness_check"),
+    /** Rotated on API-key replacement or a new OAuth grant, never routine refresh. */
+    readinessCredentialBinding: varchar("readiness_credential_binding", { length: 64 }),
     connectedAt: timestamp("connected_at", { fsp: 3 }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { fsp: 3 })
       .notNull()
@@ -170,6 +184,7 @@ export const ExternalMcpConnectionTable = mysqlTable(
       "organization_id",
     ).notNull(),
     name: varchar("name", { length: 255 }).notNull(),
+    externalKey: varchar("external_key", { length: 128 }),
     url: varchar("url", { length: 2048 }).notNull(),
     authType: mysqlEnum("auth_type", externalMcpAuthTypeValues).notNull(),
     /**
@@ -195,20 +210,31 @@ export const ExternalMcpConnectionTable = mysqlTable(
     oauthConfiguration: compatJsonColumn<ExternalMcpOAuthConfiguration>("oauth_configuration"),
     toolPolicy: compatJsonColumn<ExternalMcpToolPolicy>("tool_policy"),
     /**
+     * When true, granted members may reach this connection as a standard MCP
+     * server through Den's per-connection endpoint: the provider's own tool
+     * catalog is listed and callable directly instead of only through the
+     * bounded search_capabilities/execute_capability pair. Access grants and
+     * the tool policy still apply on every request. Defaults to false so
+     * existing connections keep the bounded surface.
+     */
+    exposeDirectly: boolean("expose_directly").notNull().default(false),
+    /**
      * How the connection's credential relates to people:
      * - "shared": one org-level credential (this row's token columns, or
      *   apiKey). Everyone granted access acts as that single account —
      *   right for service-account/bot-style integrations.
-     * - "per_member": the connection (and its dynamically-registered OAuth
-     *   client) is org-level, but each member authorizes their own account;
-     *   tokens live in ConnectedAccountTable keyed by
+      * - "per_member": the connection (and any OAuth client) is org-level,
+      *   but each member authorizes their own account or enrolls their own
+      *   API key. Credentials live in ConnectedAccountTable keyed by
      *   (orgMembershipId, providerId = this row's id). The agent then acts
      *   as the calling member, preserving the provider's own ACLs and audit
      *   trail — right for Notion/Linear-style personal-permission SaaS.
      */
     credentialMode: mysqlEnum("credential_mode", externalMcpCredentialModeValues).notNull().default("shared"),
-    /** Only set when authType = "apikey". Sent as a Bearer token. */
+    /** Only set for authType="apikey", credentialMode="shared". Never a personal-key fallback. Sent as a Bearer token. */
     apiKey: encryptedTextColumn("api_key"),
+    /** Administrator-selected transport only; the member supplies the raw key. */
+    apiKeyAuthScheme: mysqlEnum("api_key_auth_scheme", ["bearer", "token"]).notNull().default("bearer"),
     /**
      * OAuth tokens for authType = "oauth". Unlike ConnectedAccountTable,
      * this is deliberately org-level, not per-member: an external MCP
@@ -220,7 +246,7 @@ export const ExternalMcpConnectionTable = mysqlTable(
     accessToken: encryptedTextColumn("access_token"),
     refreshToken: encryptedTextColumn("refresh_token"),
     tokenType: varchar("token_type", { length: 64 }),
-    scope: varchar("scope", { length: 1024 }),
+    scope: text("scope"),
     expiresAt: timestamp("expires_at", { fsp: 3 }),
     /**
      * Transient PKCE code verifier, present only between connect/start and
@@ -228,6 +254,9 @@ export const ExternalMcpConnectionTable = mysqlTable(
      */
     pendingCodeVerifier: encryptedTextColumn("pending_code_verifier"),
     credentialHealth: compatJsonColumn<ExternalMcpCredentialHealth>("credential_health"),
+    readinessCheck: compatJsonColumn<ExternalMcpReadinessCheck>("readiness_check"),
+    /** Rotated on API-key replacement or a new OAuth grant, never routine refresh. */
+    readinessCredentialBinding: varchar("readiness_credential_binding", { length: 64 }),
     /**
      * Set when live discovery no longer matches the selected OAuth issuer.
      * The mismatch remains fail-closed until an administrator explicitly
@@ -246,6 +275,10 @@ export const ExternalMcpConnectionTable = mysqlTable(
   },
   (table) => [
     index("external_mcp_connection_organization_id").on(table.organizationId),
+    uniqueIndex("external_mcp_connection_org_external_key").on(
+      table.organizationId,
+      table.externalKey,
+    ),
   ],
 )
 

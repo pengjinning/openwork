@@ -5,14 +5,12 @@ const SAFE_INCLUDED_TAGS = new Set([
   "Invitations",
   "API Keys",
   "Members",
-  "Roles",
+  "Permissions",
   "Teams",
   "Templates",
   "LLM Providers",
   "Workers",
-  "Worker Runtime",
   "Worker Activity",
-  "Memory",
   "Config Objects",
   "Plugins",
   "Marketplaces",
@@ -22,6 +20,7 @@ const SAFE_INCLUDED_TAGS = new Set([
   "Capability Sources",
   "Automations",
   "Codemode Runs",
+  "Workflows",
 ])
 
 const BLOCKED_OPERATION_IDS = new Set([
@@ -32,8 +31,6 @@ const BLOCKED_OPERATION_IDS = new Set([
   "deleteOrg",
   "deleteV1Org",
   "deleteV1OrgsByOrgId",
-  "postWorkersByWorkerIdTokens",
-  "postV1WorkersByWorkerIdTokens",
   "postOauthProvidersByProviderIdDisconnect",
   "postV1OauthProvidersByProviderIdDisconnect",
   "mintAutomationRunnerToken",

@@ -87,19 +87,24 @@ export type DesktopIntegrationResult = {
 
 export type OpenworkServerInfo = {
   running: boolean;
-  engineRollover: boolean;
-  remoteAccessEnabled: boolean;
+  /**
+   * Monotonic per-start identity of the embedded server within this desktop
+   * process. Sticky ports and persisted tokens keep the connection details
+   * identical across restarts, so clients that must re-deliver state to a new
+   * server lifetime (e.g. the Connect policy) key on this value. Null when
+   * the bridge predates the field or no start completed yet.
+   */
+  generation: number | null;
   host: string | null;
   port: number | null;
   baseUrl: string | null;
-  connectUrl: string | null;
-  mdnsUrl: string | null;
-  lanUrl: string | null;
   clientToken: string | null;
   ownerToken: string | null;
   hostToken: string | null;
   managedOpencodeBinPath: string | null;
   managedOpencodeBinSource: string | null;
+  /** Structured server log on disk, or null when the server runs without a file sink. */
+  logFilePath: string | null;
   pid: number | null;
   lastStdout: string | null;
   lastStderr: string | null;
@@ -290,6 +295,7 @@ export type NukeReceipt = {
 };
 
 export type DesktopFetchInit = {
+  transferId?: string;
   method?: string;
   headers?: Record<string, string>;
   body?: string;
@@ -306,47 +312,33 @@ export type DesktopFetchResult = {
   body: string;
 };
 
+/**
+ * Outcome of opening a workspace file from chat. The host resolves the file on disk and
+ * only launches it when it is a real file inside the real workspace root; a file that
+ * resolves elsewhere is shown in its folder instead of being handed to an application.
+ */
+export type DesktopWorkspaceFileOpenResult =
+  | { ok: true; action: "opened" | "revealed" }
+  | { ok: false; error: string };
+
+export type DesktopBinaryDownloadResult = {
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  path: string | null;
+  bytes: number;
+  body?: string;
+};
+
 export type WorkspaceCreateInput = {
   folderPath: string;
   name?: string | null;
   preset?: string | null;
 };
 
-export type WorkspaceCreateRemoteInput = {
-  baseUrl: string;
-  remoteType?: "openwork" | "opencode" | null;
-  directory?: string | null;
-  displayName?: string | null;
-  openworkHostUrl?: string | null;
-  openworkToken?: string | null;
-  openworkClientToken?: string | null;
-  openworkHostToken?: string | null;
-  openworkWorkspaceId?: string | null;
-  openworkWorkspaceName?: string | null;
-  sandboxBackend?: string | null;
-  sandboxRunId?: string | null;
-  sandboxContainerName?: string | null;
-};
-
-export type WorkspaceUpdateRemoteInput = WorkspaceCreateRemoteInput & {
-  workspaceId: string;
-};
-
 export type UiControlBridgeInfo = {
   baseUrl?: string;
   token?: string;
-};
-
-export type ComputerUsePermissions = {
-  ok: boolean;
-  accessibility: boolean;
-  screenRecording: boolean;
-  error?: string;
-};
-
-export type RunningAppsResult = {
-  ok: boolean;
-  apps: string[];
 };
 
 // ---------------------------------------------------------------------------
@@ -359,17 +351,7 @@ export type DesktopCommandMap = {
   workspaceSetSelected: { args: [workspaceId: string]; result: WorkspaceList };
   workspaceSetRuntimeActive: { args: [workspaceId: string | null]; result: WorkspaceList };
   workspaceCreate: { args: [input: WorkspaceCreateInput]; result: WorkspaceList };
-  workspaceCreateRemote: { args: [input: WorkspaceCreateRemoteInput]; result: WorkspaceList };
-  workspaceUpdateRemote: { args: [input: WorkspaceUpdateRemoteInput]; result: WorkspaceList };
-  workspaceUpdateDisplayName: {
-    args: [input: { workspaceId: string; displayName?: string | null }];
-    result: WorkspaceList;
-  };
   workspaceForget: { args: [workspaceId: string]; result: WorkspaceList };
-  workspaceAddAuthorizedRoot: {
-    args: [input: { workspacePath: string; folderPath?: string; authorizedRoot?: string }];
-    result: unknown;
-  };
   workspaceOpenworkRead: {
     args: [input: { workspacePath: string }];
     result: WorkspaceOpenworkConfig;
@@ -378,39 +360,14 @@ export type DesktopCommandMap = {
     args: [input: { workspacePath: string; config: WorkspaceOpenworkConfig }];
     result: unknown;
   };
-  workspaceExportConfig: {
-    args: [input: { workspaceId: string; outputPath: string }];
-    result: WorkspaceExportSummary;
-  };
-  workspaceImportConfig: {
-    args: [input: { archivePath: string; targetDir: string; name?: string | null }];
-    result: unknown;
-  };
-
-  // Opencode custom commands
-  opencodeCommandList: {
-    args: [input: { scope: string; projectDir?: string }];
-    result: string[];
-  };
-  opencodeCommandWrite: {
-    args: [input: { scope: string; projectDir?: string; command: OpencodeCommandDraft }];
-    result: unknown;
-  };
-  opencodeCommandDelete: {
-    args: [input: { scope: string; projectDir?: string; name: string }];
-    result: unknown;
-  };
 
   // Engine / runtime lifecycle
   engineStart: { args: [projectDir: string, options?: Record<string, unknown>]; result: EngineInfo };
-  prepareFreshRuntime: { args: []; result: unknown };
   runtimeBootstrap: { args: []; result: unknown };
   runtimeStatus: { args: []; result: unknown };
   engineStop: { args: []; result: EngineInfo };
   engineRestart: { args: [options?: Record<string, unknown>]; result: EngineInfo };
   engineInfo: { args: []; result: EngineInfo };
-  engineDoctor: { args: [projectDir?: string]; result: EngineDoctorResult };
-  engineInstall: { args: []; result: unknown };
 
   // App / bridge info
   appBuildInfo: { args: []; result: AppBuildInfo };
@@ -431,14 +388,7 @@ export type DesktopCommandMap = {
   desktopIntegrationRemove: { args: []; result: DesktopIntegrationResult };
   getUiControlBridgeInfo: { args: []; result: UiControlBridgeInfo | null };
   getOpenworkUiMcpCommand: { args: []; result: string[] };
-  getComputerUseMcpCommand: { args: []; result: string[] };
   getOpenworkUiMcpEnvironment: { args: []; result: Record<string, string> };
-
-  // Computer use
-  checkComputerUsePermissions: { args: []; result: ComputerUsePermissions };
-  listRunningApps: { args: []; result: RunningAppsResult };
-  openComputerUsePermissionSetup: { args: []; result: ComputerUsePermissions };
-  openComputerUsePermissionSettings: { args: []; result: unknown };
 
   // Bootstrap config
   getDesktopBootstrapConfig: { args: []; result: DesktopBootstrapConfig };
@@ -460,9 +410,6 @@ export type DesktopCommandMap = {
   };
   nukeOpenworkAndOpencodeConfigPreview: { args: [options?: NukeOptions]; result: NukeManifestPreview };
   nukeOpenworkAndOpencodeConfigAndExit: { args: [options?: NukeOptions]; result: NukeReceipt };
-
-  // Sandbox
-  sandboxCleanupOpenworkContainers: { args: []; result: OpenworkDockerCleanupResult };
 
   // Openwork server sidecar
   openworkServerInfo: { args: []; result: OpenworkServerInfo };
@@ -490,10 +437,6 @@ export type DesktopCommandMap = {
       },
     ];
     result: string | string[] | null;
-  };
-  saveFile: {
-    args: [options?: { title?: string; defaultPath?: string; filters?: { name: string; extensions: string[] }[] }];
-    result: string | null;
   };
 
   // Skills
@@ -527,26 +470,43 @@ export type DesktopCommandMap = {
    * whether "onboarding" should preserve desktop workspace state.
    */
   resetOpenworkState: { args: [mode?: "onboarding" | "all"]; result: unknown };
-  resetOpencodeCache: { args: []; result: CacheResetResult };
   opencodeMcpAuth: { args: [action: string, name: string]; result: ExecResult };
-  setWindowDecorations: { args: [decorated: boolean]; result: unknown };
 
   // Window / OS utilities (dunder commands)
+  __showContextMenu: { args: [request: NativeContextMenuRequest]; result: string | null };
+  __cancelContextMenu: { args: [requestId: string]; result: boolean };
   __openPath: { args: [target: string]; result: unknown };
+  __openWorkspaceFile: { args: [workspaceRoot: string, target: string]; result: DesktopWorkspaceFileOpenResult };
   __revealItemInDir: { args: [target: string]; result: unknown };
-  __getFileIcon: { args: [target: string, size?: "small" | "normal" | "large"]; result: string | null };
   __applyBrandAppName: { args: [appName: string | null]; result: { ok: true; appName: string } };
   __applyBrandIcon: { args: [url: string | null]; result: BrandIconApplyResult };
   __getBrandIconState: { args: []; result: BrandIconState };
   __evalRelaunch: { args: []; result: EvalRelaunchResult };
   __getApplicationsForFile: { args: [target: string]; result: { name: string; appPath: string; icon: string | null }[] };
-  __openWithApp: { args: [target: string, appPath: string]; result: unknown };
+  __openWithApp: { args: [target: string, appPath: string, workspaceRoot: string]; result: unknown };
   __fetch: { args: [url: string, init?: DesktopFetchInit]; result: DesktopFetchResult };
+  __cancelTransfer: { args: [transferId: string]; result: boolean };
   __homeDir: { args: []; result: string };
   __joinPath: { args: [...segments: string[]]; result: string };
   __setZoomFactor: { args: [factor: number]; result: boolean };
   __setNativeTheme: { args: [theme: string]; result: unknown };
   __setApplicationMenuVisible: { args: [visible: boolean]; result: unknown };
+};
+
+/** Data-only context menu contract; callbacks and privileged Electron roles never cross IPC. */
+export type NativeContextMenuItem = { type: "separator" } | {
+  type: "item";
+  id: string;
+  label: string;
+  enabled?: boolean;
+  submenu?: NativeContextMenuItem[];
+};
+
+export type NativeContextMenuRequest = {
+  requestId?: string;
+  items: NativeContextMenuItem[];
+  point: { x: number; y: number };
+  includeEditing?: boolean;
 };
 
 export type DesktopCommandName = keyof DesktopCommandMap;

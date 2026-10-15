@@ -1,8 +1,6 @@
 import type { WorkspaceWire } from "@openwork/types/workspace";
 
-export type WorkspaceType = "local" | "remote";
-
-export type RemoteType = "opencode" | "openwork";
+export type WorkspaceType = "local";
 
 export type ApprovalMode = "manual" | "auto";
 
@@ -20,14 +18,9 @@ export interface WorkspaceConfig {
   name?: string;
   preset?: string;
   workspaceType?: WorkspaceType;
-  remoteType?: RemoteType;
   baseUrl?: string;
   directory?: string;
   displayName?: string;
-  openworkHostUrl?: string;
-  openworkToken?: string;
-  openworkWorkspaceId?: string;
-  openworkWorkspaceName?: string;
   sandboxBackend?: string;
   sandboxRunId?: string;
   sandboxContainerName?: string;
@@ -41,14 +34,9 @@ export interface WorkspaceInfo {
   path: string;
   preset: string;
   workspaceType: WorkspaceType;
-  remoteType?: RemoteType;
   baseUrl?: string;
   directory?: string;
   displayName?: string;
-  openworkHostUrl?: string;
-  openworkToken?: string;
-  openworkWorkspaceId?: string;
-  openworkWorkspaceName?: string;
   sandboxBackend?: string;
   sandboxRunId?: string;
   sandboxContainerName?: string;
@@ -83,6 +71,13 @@ export interface ApprovalConfig {
 
 export type LocalManagedMcpVaultKeyProvider = () => Promise<Uint8Array>;
 
+/** What OpenWork Desktop tells the free Auto relay about this installation. */
+export type DesktopFreeHost = {
+  currentVersion: string;
+  /** Whether this build and its bootstrap may offer signed-out Auto (the public app on hosted OpenWork Cloud). */
+  eligible: () => boolean;
+};
+
 export interface ServerConfig {
   host: string;
   port: number;
@@ -103,14 +98,17 @@ export interface ServerConfig {
   hostTokenSource: "cli" | "env" | "file" | "generated";
   logFormat: LogFormat;
   logRequests: boolean;
-  /**
-   * Roll the managed engine over instead of disposing it when a reload is
-   * needed while sessions are live: a standby engine takes new work and the
-   * old one is closed once its runs finish. Off by default (alpha).
-   */
-  engineRollover?: boolean;
   /** In-memory secure key custody supplied by an embedding host such as OpenWork Desktop. */
   localManagedMcpVaultKey?: LocalManagedMcpVaultKeyProvider;
+  /** Desktop-owned managed engines only; never enabled by remote clients. */
+  resumeInterruptedTasks?: boolean;
+  anonymousInference?: { desktop: DesktopFreeHost };
+  /**
+   * Set by OpenWork Desktop only when this is a brand-new install (no earlier
+   * OpenWork state on disk). The server then starts on this engine unless an
+   * engine choice is already saved or OpenCode v1 history exists.
+   */
+  freshInstallEngine?: "v2";
 }
 
 export interface Capabilities {
@@ -197,6 +195,7 @@ export interface SkillItem {
   description: string;
   scope: "project" | "global";
   trigger?: string;
+  error?: string;
 }
 
 export interface CommandItem {
@@ -224,6 +223,15 @@ export interface ApprovalRequest {
   paths: string[];
   createdAt: number;
   actor: Actor;
+}
+
+export type UiControlKind = "context" | "query" | "command";
+
+export interface UiControlRequest {
+  id: string;
+  kind: UiControlKind;
+  input?: unknown;
+  createdAt: number;
 }
 
 export interface AuditEntry {

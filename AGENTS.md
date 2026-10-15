@@ -6,15 +6,15 @@ Cowork and Codex, built on OpenCode, running any model from 50+ providers.
 Desktop mode keeps files local; cloud is optional. Three surfaces live in this
 repo:
 
-- **Desktop app** (`apps/`, `packages/`) — local-first agent workspace: chat on
+* **Desktop app** (`apps/`, `packages/`) — local-first agent workspace: chat on
   files, skills, browser automation, scheduled automations, Anthropic-compatible
   plugins.
-- **OpenWork MCP gateway** (`ee/apps/den-api`) — one URL
+* **OpenWork MCP gateway** (`ee/apps/den-api`) — one URL
   (`api.openworklabs.com/mcp/agent`) that brings org-assigned skills, plugins,
   and connections (Google Workspace, Microsoft 365, MCPs) into Codex, Claude
   Code, Cursor, or any MCP client via `search_capabilities` /
   `execute_capability`.
-- **OpenWork Den** (`ee/apps/den-*`) — the org control plane: provision
+* **OpenWork Den** (`ee/apps/den-*`) — the org control plane: provision
   inference, manage teams and access, set desktop policies, publish skills and
   plugins through marketplaces.
 
@@ -22,52 +22,67 @@ The app consumes OpenWork server surfaces (self-hosted or hosted) rather than
 inventing parallel behavior. Anything OpenCode can do is available in OpenWork,
 even before a dedicated UI exists.
 
-## Verification (every change)
+Customer-cloud managed installation architecture lives in
+`infra/managed-deployments/README.md` and `docs/managed-deployments.md`. AWS
+uses CloudFormation/CodeBuild; GCP uses customer-approved Cloud Shell and
+impersonated Terraform behind `managedDeploymentsGcp` (cloud only, off).
+Installer publication/configuration is an operator action, not CLI sign-in or a
+feature rollout. Never fake readiness; local tests do not prove a live install.
+Killing a rollout blocks launches without deleting customer resources or
+interrupting authenticated enrollment/health reports.
 
-- The only proof path is `evals/specs/**/*.test.ts` with `test` from
-  `@openwork/testkit`; app-driving specs use `.slow.test.ts`. Prose, screenshots,
-  and recordings never decide pass/fail — the testkit tape does.
-- Skills own the mechanics: `prove-a-pr` → `write-a-spec` → `run-tests` →
-  `diagnose-a-red-run` when red → `publish-evidence`. Evidence is ambient; never
-  create or pass roll handles.
-- Verdicts: `Passed` only when every claim has an observable assertion in the
-  tape; otherwise `Incomplete` or `Failed` with repro steps. Skips are never
-  passed.
-- Prefer Daytona when credentials are available; local fallback is an expected
-  OSS path, not a failure. Report which lane ran.
-- Docs/comments, types-only, and inert agent config may skip runtime proof — say so.
+## Confidentiality (hard rule — this repo is public)
 
-## Pull requests
+Never let a branch name, commit, PR text, comment, fixture, or evidence identify
+a customer, prospect, partner, or outside person; use internal ticket IDs, and
+escalate any leak instead of rewriting history.
 
-- Do not default to draft PRs. A request to create or make a PR means a
-  ready-for-review PR once the required proof is published. Use a draft only
-  when the requester explicitly asks for one or the current verdict is
-  `Incomplete` or `Failed`, and state exactly what proof is missing.
-- Run tests and report commands + results. A runtime-observable change is not
-  done until its testkit tape is visible on the PR. If validation cannot run,
-  say why and give exact repro steps.
-- Feature work is demo-driven: `/voiceover <feature>` — no code until the script
-  is approved — then a fresh worktree (never the user's checkout), spec from the
-  narration, PR against `dev` with the tape. The `voiceover` skill owns the
-  journey.
+## Generated API contracts
 
-## Local headless web (agents)
+After changing Den routes, their shared schemas, or the feature registry, run
+`pnpm den:contract` (also run by `pnpm features:sync`) and
+include `packages/docs/openapi.json` and `packages/sdk/src/gen/**` in the same
+commit. The command builds once and generates both outputs from one snapshot. It
+prepares and removes a disposable local MySQL database automatically; start
+MySQL with `pnpm dev:den:mysql`. It never uses `DATABASE_URL`; use
+`OPENWORK_CONTRACT_MYSQL_URL` only for alternate localhost credentials.
+After merging/rebasing `dev`, regenerate rather than choosing ours/theirs for
+conflicted generated files. Never hand-edit them or regenerate a Drizzle migration
+snapshot to resolve an API conflict.
 
-- `pnpm dev:headless-web --detach` launches an isolated browser UI + local
- `openwork-server` without Electron, detached from the invoking shell. Read
- `tmp/dev-headless-web.json` for `webUrl`, tokens, logs, and Den proxy URLs.
- It does not use `~/.config/openwork/server.json`. Re-running reuses a healthy
- instance; `--replace` restarts it with fresh tokens (`--keep-tokens` to
- keep the previous ones). Cloud sign-in is copy/paste handoff (Den cannot
- redirect grants to localhost): Account → Sign in → copy OpenWork link on Den
- → Paste sign-in code in Settings.
+Optional: `pnpm hooks:install` enables a pre-commit hook that skips unrelated
+commits and regenerates/stages only contract outputs for API changes. It refuses
+unstaged/untracked contract inputs or outputs, so finish partial staging first.
+Hooks never commit, push, or change CI/Warden policy; CI remains authoritative.
 
 ## Coding
 
-- pnpm only, never npm/yarn. TypeScript: never `any`, typecasts, or `as` unless
+* pnpm only, never npm/yarn. TypeScript: never `any`, typecasts, or `as` unless
   100% necessary or instructed.
-- Prefer Tailwind, React, shadcn/ui (Base UI), TanStack Query, Zustand, Zod,
+* Prefer Tailwind, React, shadcn/ui (Base UI), TanStack Query, Zustand, Zod,
   Drizzle, Better-Auth. Reuse `@/components`; end users are non-technical.
-- Smallest possible diff, then make it smaller. Propose the simpler solution. No
-  fallback expressions when types or control flow already guarantee a value.
-- If asked to do too much at once, stop and say so.
+* New feature or a change users would notice? Declare it, off, in
+  `packages/features/src/registry.ts` before writing the code, make it safe
+  to turn off, then roll it out from `/admin`. Follow
+  `.opencode/skills/add-a-feature`.
+* Any user-facing UI (desktop app, Den web, MCP Apps, artifact views) follows
+  `DESIGN.md`: read it before designing, cite its rule ids in PRs, and attach
+  screenshots of new UI. The optional
+  `.warden/skills/design-spec-review` skill can review these rules locally.
+
+## Verify changes headless
+
+Launching the desktop app on a developer's computer opens a window that takes
+focus. Check app UI in headless Chrome instead:
+
+* Specs: `seed.appWeb` (`write-a-spec`); `run-tests` explains which placement
+  tests your working tree.
+* By hand: `pnpm world up dev-app-web --detach -- --browser`, then drive the
+  printed `cdp` address (`drive-desktop-cdp`).
+* Use the desktop app (`seed.desktop`, `pnpm dev`, `preview-desktop`,
+  `live-desktop`) only when the user asks or the change needs the desktop
+  shell: titlebar and window controls, native menus and dialogs, `openwork://`
+  links and OAuth hand-off, the built-in browser pane, updater, quit and
+  relaunch, or packaged builds. Prefer `--daytona` for those so the window
+  opens in a sandbox; Daytona builds a pushed commit, not your working tree.
+

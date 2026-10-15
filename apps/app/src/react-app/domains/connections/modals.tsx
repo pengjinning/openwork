@@ -15,11 +15,11 @@ export type ConnectionsModalsProps = {
   projectDir: string;
   reloadBlocked: boolean;
   activeSessions: Array<{ id: string; title: string }>;
-  isRemoteWorkspace: boolean;
   onForceStopSession: (sessionID: string) => void | Promise<void>;
   onReloadEngine: () => void | Promise<void>;
   modalState: ConnectionsModalsState;
   onCloseMcpAuthModal: () => void;
+  onMcpAuthenticated: (name: string) => void;
   onCompleteMcpAuthModal: () => void | Promise<void>;
 };
 
@@ -33,9 +33,9 @@ export default function ConnectionsModals(props: ConnectionsModalsProps) {
       reloadRequired={props.modalState.mcpAuthNeedsReload}
       reloadBlocked={props.reloadBlocked}
       activeSessions={props.activeSessions}
-      isRemoteWorkspace={props.isRemoteWorkspace}
       onForceStopSession={props.onForceStopSession}
       onClose={props.onCloseMcpAuthModal}
+      onAuthenticated={props.onMcpAuthenticated}
       onComplete={props.onCompleteMcpAuthModal}
       onReloadEngine={props.onReloadEngine}
     />

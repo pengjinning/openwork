@@ -3,8 +3,10 @@ import {
   AuthSessionTable,
   MemberTable,
   OAuthAccessTokenTable,
+  OAuthConsentTable,
   OAuthRefreshTokenTable,
 } from "@openwork-ee/den-db/schema"
+import { recordOrganizationSessionsRevoked } from "./audit/domain/sessions.js"
 import { cache } from "./cache.js"
 import { db } from "./db.js"
 
@@ -17,16 +19,26 @@ export type MembershipCredentialRevocationCounts = {
   oauthRefreshTokens: number
 }
 
+/** Why an organization change revoked the user's sessions (session.revoked reasonCode). */
+export type MembershipSessionRevocationReason = "member_removed" | "role_changed" | "role_permissions_changed" | "ownership_transferred"
+
 export async function revokeMembershipSessionCredentials(input: {
   organizationId: OrganizationId
   userId: UserId | null
+  /** The affected membership (removed or changed), for the audit event. */
+  memberId: string | null
+  reason: MembershipSessionRevocationReason
 }): Promise<MembershipCredentialRevocationCounts> {
   if (!input.userId) {
     return { sessions: 0, oauthAccessTokens: 0, oauthRefreshTokens: 0 }
   }
 
+  // A request that read the membership before this change must not cache it
+  // again: MCP requests check membership through this cache.
+  await cache.org.revokeMembership({ organizationId: input.organizationId, userId: input.userId })
+
   const sessions = await db
-    .select({ id: AuthSessionTable.id, token: AuthSessionTable.token })
+    .select({ id: AuthSessionTable.id, token: AuthSessionTable.token, userId: AuthSessionTable.userId, expiresAt: AuthSessionTable.expiresAt, activeOrganizationId: AuthSessionTable.activeOrganizationId })
     .from(AuthSessionTable)
     .where(eq(AuthSessionTable.userId, input.userId))
 
@@ -36,7 +48,14 @@ export async function revokeMembershipSessionCredentials(input: {
     await db
       .delete(AuthSessionTable)
       .where(inArray(AuthSessionTable.id, sessions.map((session) => session.id)))
-    await Promise.all(sessions.map((session) => cache.auth.deleteSession(session.token)))
+    // Membership removal/role downgrade revokes sessions and clears their cache entries.
+    await Promise.all(sessions.flatMap((session) => [
+      cache.auth.revokeSession(session.token),
+      cache.auth.revokeSessionId(session.id),
+    ]))
+    // Direct delete: no better-auth hook fires. session.revoked in the affected
+    // organization (never blocks or rolls back the revocation).
+    await recordOrganizationSessionsRevoked({ organizationId: input.organizationId, memberId: input.memberId, userId: input.userId, sessions, reasonCode: input.reason })
   }
 
   const oauthAccessTokens = await db
@@ -51,6 +70,21 @@ export async function revokeMembershipSessionCredentials(input: {
     await db
       .delete(OAuthAccessTokenTable)
       .where(inArray(OAuthAccessTokenTable.id, oauthAccessTokens.map((token) => token.id)))
+  }
+
+  const oauthConsents = await db
+    .select({ id: OAuthConsentTable.id })
+    .from(OAuthConsentTable)
+    .where(and(
+      eq(OAuthConsentTable.userId, input.userId),
+      eq(OAuthConsentTable.referenceId, input.organizationId),
+    ))
+
+  if (oauthConsents.length > 0) {
+    await db
+      .delete(OAuthConsentTable)
+      .where(inArray(OAuthConsentTable.id, oauthConsents.map((consent) => consent.id)))
+    await Promise.all(oauthConsents.map((consent) => cache.auth.revokeGrant(consent.id)))
   }
 
   const oauthRefreshTokens = await db

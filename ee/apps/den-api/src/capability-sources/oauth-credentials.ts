@@ -6,6 +6,7 @@ import {
 } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, type DenTypeId } from "@openwork-ee/utils/typeid"
 import { db } from "../db.js"
+import { requestRead } from "../request-reads.js"
 
 /**
  * Generic, provider-agnostic reads/writes for the two credential tables.
@@ -45,6 +46,10 @@ export function normalizeConnectedAccountScopes(value: unknown): string[] | null
   return parsed
 }
 
+export function parseGrantedOAuthScopes(scope: string | undefined): string[] | null {
+  return scope === undefined ? null : scope.split(" ").filter(Boolean)
+}
+
 function normalizeOrgOAuthClientRow(row: OrgOAuthClientRow): OrgOAuthClientRow {
   return { ...row, extra: normalizeOAuthClientExtra(row.extra) }
 }
@@ -78,7 +83,12 @@ function connectedAccountChanges(input: ConnectedAccountUpsertInput) {
   }
 }
 
-export async function getOrgOAuthClient(organizationId: OrganizationId, providerId: string): Promise<OrgOAuthClientRow | null> {
+/** Shared within the request. A writer reading back its own row uses readOrgOAuthClient. */
+export function getOrgOAuthClient(organizationId: OrganizationId, providerId: string): Promise<OrgOAuthClientRow | null> {
+  return requestRead(`org-oauth-client:${organizationId}:${providerId}`, () => readOrgOAuthClient(organizationId, providerId))
+}
+
+async function readOrgOAuthClient(organizationId: OrganizationId, providerId: string): Promise<OrgOAuthClientRow | null> {
   const rows = await db
     .select()
     .from(OrgOAuthClientTable)
@@ -125,7 +135,16 @@ export async function upsertOrgOAuthClient(input: {
     extra: input.extra ?? null,
     createdByOrgMembershipId: input.createdByOrgMembershipId,
   })
-  return (await getOrgOAuthClient(input.organizationId, input.providerId))!
+  return (await readOrgOAuthClient(input.organizationId, input.providerId))!
+}
+
+/**
+ * getConnectedAccount for listings and status checks, shared within the request.
+ * Code that refreshes or uses a token keeps calling getConnectedAccount, which
+ * always reads fresh: a refresh that lost a race re-reads without writing.
+ */
+export function getConnectedAccountForListing(input: Parameters<typeof getConnectedAccount>[0]): Promise<ConnectedAccountRow | null> {
+  return requestRead(`connected-account:${input.organizationId}:${input.orgMembershipId}:${input.providerId}`, () => getConnectedAccount(input))
 }
 
 export async function getConnectedAccount(input: {
@@ -220,7 +239,14 @@ async function updateExistingConnectedAccountForActiveMember(
 
     await tx
       .update(ConnectedAccountTable)
-      .set(connectedAccountChanges(input))
+      .set({
+        ...connectedAccountChanges(input),
+        // Only a completed authorization advances the member's connection marker.
+        // Keep it distinct even if two completions share a millisecond.
+        ...(input.expectedPendingCodeVerifier !== undefined
+          ? { connectedAt: new Date(Math.max(Date.now(), existing.connectedAt.getTime() + 1)) }
+          : {}),
+      })
       .where(eq(ConnectedAccountTable.id, existing.id))
 
     const saved = await tx

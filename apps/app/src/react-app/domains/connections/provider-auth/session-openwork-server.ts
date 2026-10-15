@@ -9,13 +9,13 @@
 // the Den session, and server-side cloud provider sync never started (#3671).
 //
 // This adapter reports the truth for the endpoint it wraps:
-// - local endpoints (the desktop's own OpenWork server) advertise
+// - loopback local endpoints (the desktop's own OpenWork server) advertise
 //   `providerSync: true` — every OpenWork server does
 //   (apps/server/src/types.ts `Capabilities.providerSync: true`) — and carry
 //   the live host token so the store can PUT /den-session and
 //   POST /cloud-provider-sync/run;
-// - remote workspaces keep the previous conservative shape (config only): a
-//   desktop must not push its Den session to a shared remote worker.
+// - non-loopback local URL overrides stay config-only:
+//   a local workspace label does not authorize forwarding desktop credentials.
 import {
   createOpenworkServerClient,
   isLoopbackOpenworkServerUrl,
@@ -27,18 +27,22 @@ import type { ProviderAuthOpenworkServer } from "./store";
 
 type SessionOpenworkServerSnapshot = ReturnType<ProviderAuthOpenworkServer["getSnapshot"]>;
 
+/** The local server that owns the workspace, or the engine root before any workspace exists. */
+export type SessionServerEndpoint = Pick<ResolvedWorkspaceEndpoint, "baseUrl" | "token" | "client">;
+
 export type CreateSessionOpenworkServerInput = {
-  endpoint: () => ResolvedWorkspaceEndpoint | null;
+  endpoint: () => SessionServerEndpoint | null;
   /** Live host token from the desktop runtime (openworkServerInfo). */
   hostToken?: () => string;
+  generation?: () => number | null;
 };
 
-function resolveHostToken(endpoint: ResolvedWorkspaceEndpoint, live: string): string {
-  if (live) return live;
+function resolveHostToken(endpoint: SessionServerEndpoint, live: string): string {
   // Fallback mirrors openwork-server-store's getAuth(): persisted settings may
   // hold the host token (ensureDesktopLocalOpenworkConnection writes it), but
-  // only trust it for loopback servers — host tokens never travel off-machine.
+  // both live and stored host tokens must stay on loopback servers.
   if (!isLoopbackOpenworkServerUrl(endpoint.baseUrl)) return "";
+  if (live) return live;
   return readOpenworkServerSettings().hostToken?.trim() ?? "";
 }
 
@@ -48,7 +52,7 @@ export function createSessionOpenworkServer(
   let clientCacheKey = "";
   let clientCacheValue: OpenworkServerClient | null = null;
 
-  const hostAwareClient = (endpoint: ResolvedWorkspaceEndpoint, hostToken: string): OpenworkServerClient => {
+  const hostAwareClient = (endpoint: SessionServerEndpoint, hostToken: string): OpenworkServerClient => {
     if (!hostToken) return endpoint.client;
     const key = `${endpoint.baseUrl}\u001f${endpoint.token}\u001f${hostToken}`;
     if (key !== clientCacheKey || !clientCacheValue) {
@@ -72,7 +76,7 @@ export function createSessionOpenworkServer(
           openworkServerCapabilities: null,
         };
       }
-      if (endpoint.isRemote) {
+      if (!isLoopbackOpenworkServerUrl(endpoint.baseUrl)) {
         return {
           openworkServerStatus: "connected",
           openworkServerClient: endpoint.client,
@@ -83,6 +87,7 @@ export function createSessionOpenworkServer(
       return {
         openworkServerStatus: "connected",
         openworkServerClient: hostAwareClient(endpoint, hostToken),
+        openworkServerHostInfo: { generation: input.generation?.() ?? null },
         openworkServerAuth: {
           token: endpoint.token || undefined,
           hostToken: hostToken || undefined,

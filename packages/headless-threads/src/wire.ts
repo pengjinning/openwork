@@ -1,6 +1,6 @@
 /**
- * The wire boundary: schemas for what the OpenWork server already returns on
- * its session routes, plus the mapping into the headless thread types.
+ * The wire boundary: schemas for native OpenCode session payloads, plus the
+ * mapping into the headless thread types.
  *
  * Every schema is permissive about fields it does not name, so an engine or
  * server that grows a field does not break a benchmark run mid-campaign.
@@ -29,7 +29,7 @@ export const threadStatusSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("retry"), attempt: z.number(), message: z.string(), next: z.number() }),
 ]);
 
-const sessionSchema = z
+export const sessionSchema = z
   .object({
     id: z.string(),
     title: z.string().nullish(),
@@ -45,7 +45,12 @@ const partSchema = z
     text: z.string().optional(),
     tool: z.string().optional(),
     callID: z.string().optional(),
-    state: z.object({ status: z.string().optional() }).passthrough().optional(),
+    state: z.object({
+      status: z.string().optional(),
+      input: z.unknown().optional(),
+      output: z.unknown().optional(),
+      error: z.unknown().optional(),
+    }).passthrough().optional(),
     synthetic: z.boolean().optional(),
     ignored: z.boolean().optional(),
   })
@@ -84,30 +89,20 @@ const todoSchema = z
   })
   .passthrough();
 
-export const createThreadResponseSchema = z.object({
-  item: sessionSchema,
-  started: z.boolean(),
+export const threadMessagesSchema = z.array(messageSchema);
+export const threadTodosSchema = z.array(todoSchema);
+export const threadStatusesSchema = z.record(z.string(), threadStatusSchema);
+export const abortResultSchema = z.boolean();
+
+export const threadSnapshotSchema = z.object({
+  session: sessionSchema,
+  messages: threadMessagesSchema,
+  todos: threadTodosSchema,
+  status: threadStatusSchema,
 });
 
-export const threadSnapshotResponseSchema = z.object({
-  item: z.object({
-    session: sessionSchema,
-    messages: z.array(messageSchema),
-    todos: z.array(todoSchema),
-    status: threadStatusSchema,
-  }),
-});
-
-export const threadMessagesResponseSchema = z.object({
-  items: z.array(messageSchema),
-});
-
-export const abortResponseSchema = z.object({
-  ok: z.boolean(),
-});
-
-type SessionWire = z.infer<typeof sessionSchema>;
-type MessageWire = z.infer<typeof messageSchema>;
+export type SessionWire = z.infer<typeof sessionSchema>;
+export type MessageWire = z.infer<typeof messageSchema>;
 type PartWire = z.infer<typeof partSchema>;
 type TodoWire = z.infer<typeof todoSchema>;
 
@@ -122,6 +117,9 @@ function toPart(part: PartWire): HeadlessThreadMessagePart {
   if (part.tool !== undefined) mapped.tool = part.tool;
   if (part.callID !== undefined) mapped.callId = part.callID;
   if (part.state?.status !== undefined) mapped.toolStatus = part.state.status;
+  if (part.state?.input !== undefined) mapped.toolInput = part.state.input;
+  if (typeof part.state?.output === "string") mapped.toolOutput = part.state.output;
+  if (typeof part.state?.error === "string") mapped.toolError = part.state.error;
   if (part.synthetic !== undefined) mapped.synthetic = part.synthetic;
   if (part.ignored !== undefined) mapped.ignored = part.ignored;
   return mapped;
@@ -163,7 +161,7 @@ export function toThreadMessage(message: MessageWire): HeadlessThreadMessage {
     parentId: message.info.parentID ?? null,
     createdAt: message.info.time?.created ?? null,
     error: toMessageError(message.info.error),
-    usage: message.info.role === "assistant" ? {
+    usage: message.info.role === "assistant" && message.info.tokens ? {
       inputTokens: message.info.tokens?.input ?? 0,
       outputTokens: message.info.tokens?.output ?? 0,
       reasoningTokens: message.info.tokens?.reasoning ?? 0,
@@ -190,7 +188,7 @@ export function toThread(session: SessionWire, workspaceId: string, started: boo
   };
 }
 
-export function toSnapshot(item: z.infer<typeof threadSnapshotResponseSchema>["item"]): HeadlessThreadSnapshot {
+export function toSnapshot(item: z.infer<typeof threadSnapshotSchema>): HeadlessThreadSnapshot {
   return {
     threadId: item.session.id,
     title: optionalString(item.session.title),

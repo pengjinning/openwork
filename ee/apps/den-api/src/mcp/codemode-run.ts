@@ -26,9 +26,14 @@ function isJsonSafe(value: unknown, seen = new Set<object>()): value is CodeMode
   return safe
 }
 
+// A runaway-loop guard, not a work budget: scripts call tools without a
+// per-call approval, and the timeout and output cap bound everything else.
+const DEFAULT_MAX_TOOL_CALLS = 1_024
+
 export async function runCodemodeScript(input: {
   code: string
   scriptInput?: unknown
+  readOnlyInput?: boolean
   tools: CodemodeToolTree
   timeoutMs: number
   maxToolCalls?: number
@@ -49,9 +54,10 @@ export async function runCodemodeScript(input: {
     code: input.code,
     tools: input.tools,
     ...(bindings ? { bindings } : {}),
+    readonlyBindings: input.readOnlyInput,
     limits: {
       timeoutMs: input.timeoutMs,
-      maxToolCalls: input.maxToolCalls ?? 50,
+      maxToolCalls: input.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS,
       maxOutputBytes: input.maxOutputBytes ?? 65_536,
     },
   }))

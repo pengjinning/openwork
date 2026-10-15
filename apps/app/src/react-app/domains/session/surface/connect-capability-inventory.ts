@@ -1,5 +1,7 @@
+import type { CloudImportedPlugin } from "@/app/cloud/import-state";
 import type {
   DenAssignedMarketplaceCapability,
+  DenMeLibraryPlugin,
   DenOrgMarketplace,
   DenOrgMarketplaceResolved,
   DenOrgPlugin,
@@ -13,19 +15,44 @@ export type ConnectCapabilityClient = {
   listAssignedMarketplaceCapabilities: (
     organizationId: string,
   ) => Promise<DenAssignedMarketplaceCapability[]>;
+  listMeLibraryPlugins?: (organizationId: string) => Promise<DenMeLibraryPlugin[]>;
   listOrgMarketplaces: (organizationId: string) => Promise<DenOrgMarketplace[]>;
   getOrgMarketplaceResolved: (
     organizationId: string,
     marketplaceId: string,
   ) => Promise<DenOrgMarketplaceResolved>;
-  getOrgPluginResolved: (
+  getOrgPluginsResolved: (
     organizationId: string,
-    plugin: DenOrgPlugin,
-  ) => Promise<DenOrgPluginResolved>;
+    plugins: DenOrgPlugin[],
+  ) => Promise<DenOrgPluginResolved[]>;
+};
+
+export type ConnectPluginFile = {
+  configObjectId: string;
+  objectType: string;
+  title: string;
+  path: string;
+  versionId: string | null;
+  updatedAt: string | null;
+  skillName?: string;
+  skillOrigin?: "openwork-connect";
+  marketplaceName?: string;
+  pluginName?: string;
+  connectCapabilityName?: string;
+};
+
+export type ConnectPluginCard = {
+  pluginId: string;
+  marketplaceId: string;
+  marketplaceName: string;
+  name: string;
+  description: string | null;
+  files: ConnectPluginFile[];
 };
 
 export type ConnectCapabilityInventory = {
   skills: ConnectSkillCard[];
+  plugins: ConnectPluginCard[];
   mcpServers: McpServerEntry[];
   mcpStatuses: McpStatusMap;
 };
@@ -36,9 +63,34 @@ export type ConnectSkillCard = SkillCard & {
 
 export const EMPTY_CONNECT_CAPABILITY_INVENTORY: ConnectCapabilityInventory = {
   skills: [],
+  plugins: [],
   mcpServers: [],
   mcpStatuses: {},
 };
+
+export function connectPluginsForComposer(plugins: ConnectPluginCard[]): CloudImportedPlugin[] {
+  return plugins.map((plugin) => ({
+    pluginId: plugin.pluginId,
+    marketplaceId: plugin.marketplaceId,
+    name: plugin.name,
+    description: plugin.description,
+    updatedAt: null,
+    importedAt: null,
+    files: plugin.files.map((file) => ({
+      configObjectId: file.configObjectId,
+      versionId: file.versionId,
+      objectType: file.objectType,
+      title: file.title,
+      path: file.path,
+      updatedAt: file.updatedAt,
+      skillName: file.skillName,
+      skillOrigin: file.skillOrigin,
+      marketplaceName: file.marketplaceName,
+      pluginName: file.pluginName,
+      connectCapabilityName: file.connectCapabilityName,
+    })),
+  }));
+}
 
 type MarketplacePlugin = {
   marketplace: DenOrgMarketplace;
@@ -136,6 +188,8 @@ function toMcpEntries(
   return specs.map((spec) => {
     const id = `openwork-connect:${plugin.id}:${object.id}:${spec.name}`;
     const displayName = specs.length === 1 ? object.title : `${object.title} · ${spec.name}`;
+    const connection = matchingConnection(plugin, object, spec);
+    const orgMcpConnectionId = connection?.id?.trim();
     return {
       entry: {
         id,
@@ -145,33 +199,81 @@ function toMcpEntries(
         marketplaceName: marketplace.name,
         pluginName: plugin.name,
         connectCapabilityName: marketplaceCapabilityName(plugin.id, object.id),
+        orgMcpConnectionId: orgMcpConnectionId || undefined,
       },
-      status: remoteMcpStatus(plugin, matchingConnection(plugin, object, spec)),
+      status: remoteMcpStatus(plugin, connection),
     };
   });
+}
+
+const MEMBER_LIBRARY_MARKETPLACE: DenOrgMarketplace = {
+  id: "me-library",
+  name: "Library",
+  description: null,
+  status: "active",
+  pluginCount: 0,
+  updatedAt: null,
+};
+
+function pluginFromLibraryItem(item: DenMeLibraryPlugin): DenOrgPlugin {
+  return {
+    id: item.id,
+    name: item.name,
+    description: item.description,
+    status: "active",
+    memberCount: 0,
+    updatedAt: null,
+    componentCounts: {},
+  };
 }
 
 export async function listAssignedConnectCapabilities(input: {
   client: ConnectCapabilityClient;
   organizationId: string;
+  /** Activity requires a complete answer; partial lists are not removal evidence. */
+  requireComplete?: boolean;
 }): Promise<ConnectCapabilityInventory> {
-  const assigned = await input.client.listAssignedMarketplaceCapabilities(input.organizationId);
-  if (assigned.length === 0) return EMPTY_CONNECT_CAPABILITY_INVENTORY;
+  const [assigned, libraryPlugins] = await Promise.all([
+    input.client.listAssignedMarketplaceCapabilities(input.organizationId),
+    input.client.listMeLibraryPlugins
+      ? input.client.listMeLibraryPlugins(input.organizationId).catch((error: unknown) => {
+          if (input.requireComplete) throw error;
+          return [];
+        })
+      : Promise.resolve([]),
+  ]);
 
-  const assignedMarketplaceIds = new Set(assigned.map((item) => item.marketplaceId));
-  const assignedPluginKeys = new Set(assigned.map((item) => `${item.marketplaceId}:${item.pluginId}`));
+  const assignedMarketplaceIds = new Set(
+    assigned.flatMap((item) => item.marketplaceId ? [item.marketplaceId] : []),
+  );
+  const assignedPluginKeys = new Set(
+    assigned.flatMap((item) => item.marketplaceId ? [`${item.marketplaceId}:${item.pluginId}`] : []),
+  );
   const assignedCapabilityKeys = new Set(
-    assigned.map((item) => `${item.marketplaceId}:${item.pluginId}:${item.configObjectId}`),
+    assigned.flatMap((item) => (
+      item.marketplaceId ? [`${item.marketplaceId}:${item.pluginId}:${item.configObjectId}`] : []
+    )),
   );
-  const marketplaces = (await input.client.listOrgMarketplaces(input.organizationId))
-    .filter((marketplace) => marketplace.status === "active")
-    .filter((marketplace) => assignedMarketplaceIds.has(marketplace.id))
-    .sort((left, right) => left.name.localeCompare(right.name));
-  const resolvedMarketplaces = await Promise.all(
-    marketplaces.map((marketplace) =>
-      input.client.getOrgMarketplaceResolved(input.organizationId, marketplace.id)
+  // The catalog listing is paginated and can include admin-only visibility.
+  // For change detection resolve the complete grant-scoped ID set directly.
+  const marketplaces = input.requireComplete || assigned.length === 0
+    ? []
+    : (await input.client.listOrgMarketplaces(input.organizationId))
+      .filter((marketplace) => marketplace.status === "active")
+      .filter((marketplace) => assignedMarketplaceIds.has(marketplace.id))
+      .sort((left, right) => left.name.localeCompare(right.name));
+  const marketplaceIds = input.requireComplete
+    ? [...assignedMarketplaceIds]
+    : marketplaces.map((marketplace) => marketplace.id);
+  const resolvedMarketplaces = (await Promise.all(
+    marketplaceIds.map((marketplaceId) =>
+      input.client.getOrgMarketplaceResolved(input.organizationId, marketplaceId)
     ),
-  );
+  ))
+    // Both paths return the same inventory, so a complete pass can also serve
+    // the Connect views: active marketplaces only, in name order.
+    .filter((resolved) => resolved.marketplace.status === "active")
+    .sort((left, right) => left.marketplace.name.localeCompare(right.marketplace.name));
 
   const plugins = new Map<string, MarketplacePlugin>();
   for (const resolved of resolvedMarketplaces) {
@@ -184,38 +286,92 @@ export async function listAssignedConnectCapabilities(input: {
       plugins.set(plugin.id, { marketplace: resolved.marketplace, plugin });
     }
   }
+  for (const item of libraryPlugins) {
+    if (plugins.has(item.id)) continue;
+    plugins.set(item.id, {
+      marketplace: MEMBER_LIBRARY_MARKETPLACE,
+      plugin: pluginFromLibraryItem(item),
+    });
+  }
+  if (plugins.size === 0) return EMPTY_CONNECT_CAPABILITY_INVENTORY;
 
-  const resolvedPlugins = await Promise.all(
-    [...plugins.values()].map(async ({ marketplace, plugin }) => ({
-      marketplace,
-      resolved: await input.client.getOrgPluginResolved(input.organizationId, plugin),
-    })),
-  );
+  const pluginEntries = [...plugins.values()];
+  const resolvedPlugins = (await input.client.getOrgPluginsResolved(
+    input.organizationId,
+    pluginEntries.map(({ plugin }) => plugin),
+  )).map((resolved, index) => ({ marketplace: pluginEntries[index]!.marketplace, resolved }));
 
   const skills: SkillCard[] = [];
+  const pluginsById = new Map<string, ConnectPluginCard>();
   const mcpServers: McpServerEntry[] = [];
   const mcpStatuses: McpStatusMap = {};
   for (const { marketplace, resolved } of resolvedPlugins) {
+    const pluginCard: ConnectPluginCard = pluginsById.get(resolved.plugin.id) ?? {
+      pluginId: resolved.plugin.id,
+      marketplaceId: marketplace.id,
+      marketplaceName: marketplace.name,
+      name: resolved.plugin.name,
+      description: resolved.plugin.description,
+      files: [],
+    };
     for (const membership of resolved.memberships) {
       const object = membership.configObject;
+      const fromMemberLibrary = marketplace.id === MEMBER_LIBRARY_MARKETPLACE.id;
+      if (!object || object.status !== "active") continue;
       if (
-        !object
-        || object.status !== "active"
-        || !assignedCapabilityKeys.has(`${marketplace.id}:${resolved.plugin.id}:${object.id}`)
+        !fromMemberLibrary
+        && !assignedCapabilityKeys.has(`${marketplace.id}:${resolved.plugin.id}:${object.id}`)
       ) continue;
       if (object.objectType === "skill") {
-        skills.push(toSkill(marketplace, resolved.plugin, object));
+        const skill = toSkill(marketplace, resolved.plugin, object);
+        skills.push(skill);
+        pluginCard.files.push({
+          configObjectId: object.id,
+          objectType: object.objectType,
+          title: object.title,
+          path: skill.path,
+          versionId: object.latestVersion?.id ?? null,
+          updatedAt: object.updatedAt,
+          skillName: skill.name,
+          skillOrigin: "openwork-connect",
+          marketplaceName: skill.marketplaceName,
+          pluginName: skill.pluginName,
+          connectCapabilityName: skill.connectCapabilityName,
+        });
+      } else if (object.objectType === "command" || object.objectType === "agent") {
+        pluginCard.files.push({
+          configObjectId: object.id,
+          objectType: object.objectType,
+          title: object.title,
+          path: `openwork-connect://${marketplace.id}/${resolved.plugin.id}/${object.id}`,
+          versionId: object.latestVersion?.id ?? null,
+          updatedAt: object.updatedAt,
+        });
       }
       if (object.objectType === "mcp") {
+        pluginCard.files.push({
+          configObjectId: object.id,
+          objectType: object.objectType,
+          title: object.title,
+          path: `openwork-connect://${marketplace.id}/${resolved.plugin.id}/${object.id}`,
+          versionId: object.latestVersion?.id ?? null,
+          updatedAt: object.updatedAt,
+        });
         for (const item of toMcpEntries(marketplace, resolved.plugin, object)) {
           mcpServers.push(item.entry);
           mcpStatuses[item.entry.id ?? item.entry.name] = item.status;
         }
       }
     }
+    if (!pluginsById.has(resolved.plugin.id)) pluginsById.set(resolved.plugin.id, pluginCard);
   }
 
+  const pluginCards = [...pluginsById.values()]
+    // Activity also observes plugins whose contents have no desktop file
+    // projection (for example, a cloud-only Workflow).
+    .filter((plugin) => input.requireComplete || plugin.files.length > 0)
+    .sort((left, right) => left.name.localeCompare(right.name));
   skills.sort((left, right) => left.name.localeCompare(right.name));
   mcpServers.sort((left, right) => left.name.localeCompare(right.name));
-  return { skills, mcpServers, mcpStatuses };
+  return { skills, plugins: pluginCards, mcpServers, mcpStatuses };
 }

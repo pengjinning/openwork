@@ -59,7 +59,8 @@ const COMPONENT_TYPE_LABELS: Record<string, { singular: string; plural: string }
   mcp_server: { singular: "MCP server", plural: "MCP servers" },
   lsp_server: { singular: "LSP server", plural: "LSP servers" },
   monitor: { singular: "monitor", plural: "monitors" },
-  script: { singular: "Program", plural: "Programs" },
+  workflow: { singular: "Workflow", plural: "Workflows" },
+  app: { singular: "App", plural: "Apps" },
   settings: { singular: "setting", plural: "settings" },
 };
 
@@ -101,18 +102,18 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
   const access = getOrgAccessFlags(
     orgContext?.currentMember.role ?? "member",
     orgContext?.currentMember.isOwner ?? false,
-    orgContext?.roles ?? [],
+    orgContext?.currentMember.permissions,
   );
   const configurationTargets = useMemo(() => (
     data?.plugins.flatMap((plugin) => (
       plugin.cloudReadiness?.connections
         .filter((connection) => (
           pluginRequirementNeedsAdminSetup(connection)
-          || pluginReadinessConnectionAction(connection, access.isAdmin) !== null
+          || pluginReadinessConnectionAction(connection, access.canManageConnections) !== null
         ))
         .map((connection) => ({ plugin, connection })) ?? []
     )) ?? []
-  ), [access.isAdmin, data]);
+  ), [access.canManageConnections, data]);
 
   useEffect(() => {
     if (!actionsOpen) return;
@@ -129,7 +130,7 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
     return (
       <div className="mx-auto max-w-[860px] px-6 py-8 md:px-8">
         <div className="rounded-2xl border border-gray-100 bg-white px-5 py-8 text-[13px] text-gray-400">
-          Loading marketplace…
+          Loading collection…
         </div>
       </div>
     );
@@ -139,7 +140,7 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
     return (
       <div className="mx-auto max-w-[860px] px-6 py-8 md:px-8">
         <div className="rounded-2xl border border-red-100 bg-red-50 px-5 py-3.5 text-[13px] text-red-600">
-          {error instanceof Error ? error.message : "That marketplace could not be found."}
+          {error instanceof Error ? error.message : "That collection could not be found."}
         </div>
       </div>
     );
@@ -173,7 +174,7 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
           <ArrowLeft className="h-4 w-4" />
           Back
         </Link>
-        {access.isAdmin && marketplace.canDelete ? (
+        {access.canManageMarketplaces && marketplace.canDelete ? (
           <div ref={actionsRef} className="relative">
             <button
               type="button"
@@ -292,14 +293,14 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
               <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
                 <div>
                   <h2 className="text-[14px] font-semibold tracking-[-0.01em] text-gray-900">
-                    Plugins in this marketplace
+                    Plugins in this collection
                   </h2>
                   <p className="mt-0.5 text-[12.5px] text-gray-500">
-                    Everyone with access to this marketplace gets these in the desktop app.
+                    Everyone with access to this collection gets these in the desktop app.
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
-                  {access.isAdmin ? (
+                  {access.canManageAllShared ? (
                     <Link
                       href={`${getNewPluginRoute(orgSlug)}?marketplaceId=${encodeURIComponent(marketplace.id)}`}
                       className={buttonVariants({ variant: "primary", size: "sm" })}
@@ -314,7 +315,7 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
               {plugins.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-gray-200 bg-white px-5 py-10 text-center">
                   <p className="text-[14px] font-medium tracking-[-0.02em] text-gray-800">
-                    No plugins in this marketplace yet
+                    No plugins in this collection yet
                   </p>
                   <p className="mx-auto mt-2 max-w-[420px] text-[13px] leading-6 text-gray-500">
                     Plugins appear here as they're imported from the source repository.
@@ -346,7 +347,7 @@ export function MarketplaceDetailScreen({ marketplaceId }: { marketplaceId: stri
             <MarketplaceConfigureSection
               targets={configurationTargets}
               presets={presets}
-              isAdmin={access.isAdmin}
+              canManageConnections={access.canManageConnections}
               connectingConnectionId={authorization.connectingConnectionId}
               connectError={authorization.error}
               pollingConnectionId={authorization.pollingConnectionId}
@@ -434,10 +435,10 @@ function EditMarketplaceDialog({
         onClick={(event) => event.stopPropagation()}
       >
         <h2 id="edit-marketplace-title" className="text-[16px] font-semibold tracking-[-0.01em] text-gray-950">
-          Edit marketplace
+          Edit collection
         </h2>
         <p className="mt-1 text-[13px] leading-6 text-gray-500">
-          Update how this marketplace appears to your organization.
+          Update how this collection appears to your organization.
         </p>
 
         <label className="mt-4 block">
@@ -463,7 +464,7 @@ function EditMarketplaceDialog({
 
         {updateMarketplace.error ? (
           <p className="mt-3 text-[12.5px] text-red-600">
-            {updateMarketplace.error instanceof Error ? updateMarketplace.error.message : "Failed to update marketplace."}
+            {updateMarketplace.error instanceof Error ? updateMarketplace.error.message : "Failed to update collection."}
           </p>
         ) : null}
 
@@ -528,7 +529,7 @@ function DeleteMarketplaceDialog({
 
         {error ? (
           <p className="mt-4 rounded-xl bg-red-50 px-3 py-2 text-[12.5px] text-red-600">
-            {error instanceof Error ? error.message : "Failed to delete marketplace."}
+            {error instanceof Error ? error.message : "Failed to delete collection."}
           </p>
         ) : null}
 
@@ -537,7 +538,7 @@ function DeleteMarketplaceDialog({
             Cancel
           </DenButton>
           <DenButton variant="destructive" icon={Trash2} loading={busy} onClick={onConfirm} data-testid="confirm-delete-marketplace">
-            Delete marketplace
+            Delete collection
           </DenButton>
         </div>
       </div>
@@ -628,8 +629,8 @@ function MarketplaceAccessSection({ marketplaceId }: { marketplaceId: string }) 
             </p>
             <p className="mt-0.5 text-[12.5px] leading-[1.55] text-gray-500">
               {orgWideGrant
-                ? "All org members can see this marketplace."
-                : "Only admins and people you add below can see this marketplace."}
+                ? "All org members can see this collection."
+                : "Only people you add below, and people who manage everything shared, can see this collection."}
             </p>
           </div>
           <div
@@ -843,7 +844,7 @@ function AccessAddPicker({
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder={`Search ${label.toLowerCase()}...`}
-              className="w-full bg-transparent text-[12.5px] text-gray-900 placeholder:text-gray-400 focus:outline-none"
+              className="w-full bg-transparent text-[12.5px] text-gray-900 placeholder:text-gray-400 focus:outline-hidden"
               autoFocus
             />
           </div>
@@ -880,7 +881,7 @@ function AccessAddPicker({
 function MarketplaceConfigureSection({
   connectError,
   connectingConnectionId,
-  isAdmin,
+  canManageConnections,
   onConnect,
   pollingConnectionId,
   targets,
@@ -889,7 +890,8 @@ function MarketplaceConfigureSection({
 }: {
   connectError: { connectionId: string; message: string } | null;
   connectingConnectionId: string | null;
-  isAdmin: boolean;
+  /** `connections.manage`: configure services and connect organization accounts. */
+  canManageConnections: boolean;
   onConnect: (connectionId: string) => void;
   pollingConnectionId: string | null;
   targets: PluginMcpSetupTarget[];
@@ -901,7 +903,7 @@ function MarketplaceConfigureSection({
       <div className="rounded-2xl border border-gray-100 bg-white px-5 py-10 text-center">
         <p className="text-[14px] font-semibold tracking-[-0.01em] text-gray-900">Everything is configured</p>
         <p className="mx-auto mt-1.5 max-w-[420px] text-[13px] leading-6 text-gray-500">
-          This marketplace has no MCP configuration actions waiting.
+          This collection has no MCP configuration actions waiting.
         </p>
       </div>
     );
@@ -930,7 +932,7 @@ function MarketplaceConfigureSection({
           const needsAdminSetup = pluginRequirementNeedsAdminSetup(target.connection);
           const readinessAction = needsAdminSetup
             ? null
-            : pluginReadinessConnectionAction(target.connection, isAdmin);
+            : pluginReadinessConnectionAction(target.connection, canManageConnections);
 
           return (
             <div key={`${target.plugin.id}:${target.connection.configObjectId}:${target.connection.serverName}`} className="px-4 py-3.5">
@@ -946,7 +948,7 @@ function MarketplaceConfigureSection({
                   <p className="mt-0.5 truncate text-[11.5px] text-gray-500">Required by {target.plugin.name}</p>
                 </div>
                 {needsAdminSetup ? (
-                  isAdmin ? (
+                  canManageConnections ? (
                     <DenButton
                       variant="secondary"
                       size="sm"
@@ -1163,7 +1165,7 @@ export function PluginMcpSetupDialog({
               <div className="min-w-0">
                 <h2 className="text-[18px] font-semibold tracking-[-0.02em] text-gray-950">Configure {serviceName}</h2>
                 <p className="mt-1 text-[12.5px] leading-5 text-gray-500">
-                  Required by {target.plugin.name}. Access follows this marketplace.
+                  Required by {target.plugin.name}. Access follows this collection.
                 </p>
               </div>
               <button
@@ -1226,7 +1228,7 @@ export function PluginMcpSetupDialog({
                     placeholder="API key"
                   />
                   <p className="mt-1.5 text-[11.5px] leading-4 text-gray-500">
-                    Stored securely as a shared marketplace credential.
+                    Stored securely as a shared collection credential.
                   </p>
                 </div>
               ) : null}

@@ -2,7 +2,8 @@
 import { useCallback, useMemo, useState } from "react";
 import { installConfigSchema, parseInstallLinkInput } from "@openwork/install-config";
 
-import { clearDenSession, createDenClient, readDenBootstrapConfig, readDenSettings, setDenBootstrapConfig } from "@/app/lib/den";
+import { clearDenSession, readDenBootstrapConfig, readDenSettings, setDenBootstrapConfig } from "@/app/lib/den";
+import { parseManualAuthInput } from "@/app/lib/manual-auth-input";
 import { exchangeHandoffAndSignIn } from "@/app/lib/den-handoff";
 import { desktopFetchViaMain } from "@/app/lib/desktop";
 import { isDesktopRuntime } from "@/app/utils";
@@ -36,7 +37,6 @@ import { Input } from "@/components/ui/input";
 import { t } from "@/i18n";
 import { usePlatform } from "../../kernel/platform";
 import { saveControlPlaneUrl } from "../settings/cloud/control-plane-url";
-import { parseManualAuthInput } from "./forced-signin-page";
 import { parseInviteLinkInput, parseServerUrlInput, type ParsedInviteLink } from "./join-organization-input";
 
 type JoinOrganizationDialogProps = {
@@ -210,11 +210,11 @@ export function JoinOrganizationDialog({
     const parsed = parseManualAuthInput(value);
     if (!parsed) return false;
 
-    const baseUrl = parsed.baseUrl ?? readDenSettings().baseUrl;
+    const settings = readDenSettings();
+    const baseUrl = parsed.baseUrl ?? settings.baseUrl;
     setStatus({ phase: "connecting", clientName: t("join_org.openwork_cloud"), host: hostFromUrl(baseUrl) });
     const result = await exchangeHandoffAndSignIn(parsed.grant, {
       baseUrl,
-      client: createDenClient({ baseUrl }),
       // Pasted one-time codes are desktop-initiated sign-ins.
       desktopInitiated: true,
       fallbackErrorMessage: t("den.error_no_token"),

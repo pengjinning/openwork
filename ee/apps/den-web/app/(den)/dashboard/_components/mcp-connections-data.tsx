@@ -1,13 +1,16 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { getRequestError, requestJson } from "../../_lib/den-flow";
+import { z } from "zod";
+import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { DenRequestCanceledError, DenRequestTimeoutError, getRequestError, isReauthRequiredError, requestJson } from "../../_lib/den-flow";
 import { useOrgDashboard } from "../_providers/org-dashboard-provider";
+import { memberApiKeyFailureMessage } from "./member-api-key";
 import {
   type ExternalMcpDiagnostic,
   parseExternalMcpDiagnostic,
 } from "./mcp-tool-error-attribution";
 import type { McpAuthorizationDebugDetails } from "./mcp-authorization-url";
+import { libraryQueryKeys } from "./library-data";
 
 const ORG_SCOPE_HEADER = "x-openwork-org-id";
 
@@ -24,7 +27,17 @@ function requireOrgId(orgId: string | null) {
 
 export type ExternalMcpAuthType = "oauth" | "apikey" | "none";
 export type ExternalMcpCredentialMode = "shared" | "per_member";
+export type ExternalMcpApiKeyAuthScheme = "bearer" | "token";
 export type ExternalMcpConnectionScope = "usable" | "manageable";
+
+export const DEFAULT_API_KEY_AUTH_SCHEME: ExternalMcpApiKeyAuthScheme = "bearer";
+
+export function apiKeyAuthSchemeInput(
+  authType: ExternalMcpAuthType,
+  apiKeyAuthScheme: ExternalMcpApiKeyAuthScheme,
+): { apiKeyAuthScheme?: ExternalMcpApiKeyAuthScheme } {
+  return authType === "apikey" ? { apiKeyAuthScheme } : {};
+}
 
 export type ExternalMcpAccessSummary = {
   orgWide: boolean;
@@ -37,15 +50,44 @@ export type ExternalMcpRequiredBy = {
   name: string;
 };
 
+export type ConnectionReadiness = {
+  status: "ready" | "could_not_verify";
+  checkedAt: string;
+  lastSuccessfulAt: string | null;
+  reason: string | null;
+};
+
+export function useCheckMcpConnection() {
+  const { orgId } = useOrgDashboard();
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (connectionId: string) => {
+      const { response, payload } = await requestJson(`/v1/mcp-connections/${encodeURIComponent(connectionId)}/check`, {
+        method: "POST", headers: getOrgScopeHeaders(requireOrgId(orgId)),
+      }, 30000);
+      if (!response.ok) throw getRequestError(payload, response, "Could not check this connection. Try again.");
+      return z.object({ readiness: z.object({ status: z.enum(["ready", "could_not_verify"]), checkedAt: z.string(), reason: z.string().nullable() }) }).parse(payload).readiness;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.all }),
+  });
+}
+
 export type ExternalMcpConnection = {
+  /** Absent from older servers; null means no stored check. */
+  readiness?: ConnectionReadiness | null;
   id: string;
   name: string;
   url: string;
   authType: ExternalMcpAuthType;
   credentialMode: ExternalMcpCredentialMode;
+  apiKeyAuthScheme: ExternalMcpApiKeyAuthScheme;
+  /** True when granted members may use this connection as a standard MCP server with its own tool catalog. */
+  exposeDirectly: boolean;
   connected: boolean;
   connectedAt: string | null;
   createdByName?: string | null;
+  /** Whether the signed-in member added it; they can always edit or remove it. */
+  createdByYou?: boolean;
   updatedAt: string | null;
   connectedForMe: boolean;
   needsReconnect?: boolean;
@@ -233,6 +275,8 @@ export type ExternalMcpPreset = {
   url: string;
   authType: ExternalMcpAuthType;
   requiresOAuthClient?: boolean;
+  defaultOAuthClientId?: string;
+  supportedAuthTypes?: ExternalMcpAuthType[];
 };
 
 export type CreatedMcpConnection = ExternalMcpConnection & {
@@ -259,7 +303,6 @@ export const mcpConnectionQueryKeys = {
     [...mcpConnectionQueryKeys.all, "tools", orgId ?? "none", connectionId ?? "none"] as const,
   nativeProviderClient: (orgId?: string | null, providerId?: string | null) =>
     [...mcpConnectionQueryKeys.all, "native-provider-client", orgId ?? "none", providerId ?? "none"],
-  telegram: (orgId?: string | null) => [...mcpConnectionQueryKeys.all, "telegram", orgId ?? "none"] as const,
 };
 
 function isExternalMcpTool(value: unknown): value is ExternalMcpTool {
@@ -350,6 +393,7 @@ export function useUpdateMcpConnectionToolPolicy(connectionId: string) {
 const RUN_TOOL_REQUEST_TIMEOUT_MS = 160000;
 
 export function useRunMcpConnectionTool(connectionId: string) {
+  const queryClient = useQueryClient();
   const { orgId } = useOrgDashboard();
   return useMutation({
     mutationFn: async (input: { toolName: string; arguments: Record<string, unknown> }): Promise<ExternalMcpToolRun> => {
@@ -395,6 +439,10 @@ export function useRunMcpConnectionTool(connectionId: string) {
         inspection: parseToolCallInspection(payload.inspection),
       };
     },
+    onSettled: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.all }),
+      queryClient.invalidateQueries({ queryKey: libraryQueryKeys.items }),
+    ]),
   });
 }
 
@@ -417,6 +465,25 @@ export class McpOAuthConfigurationRequiredError extends McpOAuthStartError {
     super(message, details);
     this.name = "McpOAuthConfigurationRequiredError";
   }
+}
+
+const MCP_OAUTH_START_UNREADABLE_MESSAGE =
+  "OpenWork could not read the answer from its API when starting the sign-in. The browser blocked the response or the request never completed. Try again; if it keeps happening, tell your workspace admin the time of this attempt.";
+
+/**
+ * The browser refused to hand the page a response: a network failure, or an
+ * error answer (often from a proxy) without CORS headers. Without a readable
+ * status the sign-in tab would show only the browser's own text ("Failed to fetch"),
+ * so wrap what is known into structured details. Den's own timeout, cancel and
+ * re-authentication errors keep their existing meaning.
+ */
+function mcpOAuthStartUnreadableError(error: unknown): McpOAuthStartError {
+  const browserError = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return new McpOAuthStartError(MCP_OAUTH_START_UNREADABLE_MESSAGE, {
+    httpStatus: "unavailable",
+    errorCode: "response_unreadable",
+    responseJson: JSON.stringify({ error: "response_unreadable", browserError }, null, 2),
+  });
 }
 
 function nonEmptyString(value: unknown): string | undefined {
@@ -445,6 +512,7 @@ function mcpOAuthStartDebugDetails(payload: unknown, httpStatus: number): McpAut
   return {
     httpStatus,
     ...(errorCode ? { errorCode } : {}),
+    ...(diagnostic?.code ? { diagnosticCode: diagnostic.code } : {}),
     ...(redirectUri ? { redirectUri } : {}),
     ...(clientMetadataUrl ? { clientMetadataUrl } : {}),
     ...(diagnostic?.referenceId ? { diagnosticReference: diagnostic.referenceId } : {}),
@@ -564,6 +632,7 @@ async function fetchConnections(scope: ExternalMcpConnectionScope, orgId: string
     requiredBy: parseRequiredBy(connection.requiredBy),
     identityManagedBy: parseRequiredBy(connection.identityManagedBy),
     updatedAt: typeof connection.updatedAt === "string" ? connection.updatedAt : null,
+    exposeDirectly: connection.exposeDirectly === true,
     ...(typeof connection.createdByName === "string" || connection.createdByName === null ? { createdByName: connection.createdByName } : {}),
     ...(typeof connection.needsReconnect === "boolean" ? { needsReconnect: connection.needsReconnect } : {}),
     ...(connection.credentialHealth === "unknown" || connection.credentialHealth === "ready" || connection.credentialHealth === "reconnect_required"
@@ -582,17 +651,20 @@ async function fetchConnections(scope: ExternalMcpConnectionScope, orgId: string
   }));
 }
 
-export function useMcpConnections(scope: ExternalMcpConnectionScope = "manageable") {
-  const { orgId } = useOrgDashboard();
-  return useQuery({
-    enabled: Boolean(orgId),
+export function mcpConnectionsQueryOptions(orgId: string | null, scope: ExternalMcpConnectionScope) {
+  return queryOptions({
     queryKey: mcpConnectionQueryKeys.list(orgId, scope),
     queryFn: () => fetchConnections(scope, requireOrgId(orgId)),
   });
 }
 
-export function useMcpConnectionPresets() {
-  return useQuery({
+export function useMcpConnections(scope: ExternalMcpConnectionScope = "manageable") {
+  const { orgId } = useOrgDashboard();
+  return useQuery({ ...mcpConnectionsQueryOptions(orgId, scope), enabled: Boolean(orgId) });
+}
+
+export function mcpConnectionPresetsQueryOptions() {
+  return queryOptions({
     queryKey: mcpConnectionQueryKeys.presets(),
     queryFn: async (): Promise<ExternalMcpPreset[]> => {
       const { response, payload } = await requestJson("/v1/mcp-connections/presets", {}, 15000);
@@ -602,7 +674,14 @@ export function useMcpConnectionPresets() {
       const record = payload as { presets?: ExternalMcpPreset[] };
       return record.presets ?? [];
     },
+    // The catalog is fixed for a Den deploy, so one load per session is enough.
+    staleTime: Infinity,
+    gcTime: Infinity,
   });
+}
+
+export function useMcpConnectionPresets() {
+  return useQuery(mcpConnectionPresetsQueryOptions());
 }
 
 export type McpConnectionAccessInput = {
@@ -616,7 +695,9 @@ export type CreateMcpConnectionInput = {
   url: string;
   authType: ExternalMcpAuthType;
   credentialMode: ExternalMcpCredentialMode;
+  exposeDirectly?: boolean;
   apiKey?: string;
+  apiKeyAuthScheme?: ExternalMcpApiKeyAuthScheme;
   oauthClient?: {
     clientId: string;
     clientSecret?: string;
@@ -643,7 +724,9 @@ export type UpdateMcpConnectionInput = {
   url: string;
   authType: ExternalMcpAuthType;
   credentialMode: ExternalMcpCredentialMode;
+  exposeDirectly: boolean;
   apiKey?: string;
+  apiKeyAuthScheme?: ExternalMcpApiKeyAuthScheme;
   oauthClient?: {
     clientId: string;
     clientSecret?: string;
@@ -879,11 +962,20 @@ export function useStartMcpConnectionOAuth() {
 
   return useMutation({
     mutationFn: async (connectionId: string): Promise<{ status: "connected" | "needs_auth"; authorizeUrl: string | null }> => {
-      const { response, payload } = await requestJson(
-        `/v1/mcp-connections/${encodeURIComponent(connectionId)}/connect/start`,
-        { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
-        20000,
-      );
+      let response: Response;
+      let payload: unknown;
+      try {
+        ({ response, payload } = await requestJson(
+          `/v1/mcp-connections/${encodeURIComponent(connectionId)}/connect/start`,
+          { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
+          20000,
+        ));
+      } catch (error) {
+        if (isReauthRequiredError(error) || error instanceof DenRequestTimeoutError || error instanceof DenRequestCanceledError) {
+          throw error;
+        }
+        throw mcpOAuthStartUnreadableError(error);
+      }
       if (!response.ok) {
         const details = mcpOAuthStartDebugDetails(payload, response.status);
         const requestError = getRequestError(payload, response, `Failed to start OAuth (${response.status}).`);
@@ -897,6 +989,32 @@ export function useStartMcpConnectionOAuth() {
       }
       return payload as { status: "connected" | "needs_auth"; authorizeUrl: string | null };
     },
+  });
+}
+
+/**
+ * Saves the caller's own key on a per-member API-key connection. gcTime 0 and
+ * the dialog's reset() drop the key from mutation state once the form closes.
+ */
+export function useSaveMyMcpCredential() {
+  const queryClient = useQueryClient();
+  const { orgId } = useOrgDashboard();
+
+  return useMutation({
+    gcTime: 0,
+    mutationFn: async (input: { connectionId: string; apiKey: string }): Promise<void> => {
+      const response = await requestJson(
+        `/v1/mcp-connections/${encodeURIComponent(input.connectionId)}/my-credential`,
+        { method: "PUT", headers: getOrgScopeHeaders(requireOrgId(orgId)), body: JSON.stringify({ apiKey: input.apiKey }) },
+        15000,
+      ).then(({ response }) => response, () => null);
+      // Never surface server text: a provider or proxy may echo the submitted key.
+      if (!response?.ok) throw new Error(memberApiKeyFailureMessage(response?.status));
+    },
+    onSuccess: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.all }),
+      queryClient.invalidateQueries({ queryKey: libraryQueryKeys.items }),
+    ]),
   });
 }
 
@@ -1081,185 +1199,6 @@ export function useNativeProviderClient(providerId: string, enabled: boolean) {
       }
       return client;
     },
-  });
-}
-
-export type TelegramConnection = {
-  id: string;
-  status: "active" | "error";
-  connected: boolean;
-  bot: { id: string; username: string | null; displayName: string };
-  worker: { id: string; name: string; status: string };
-  webhook: { registered: boolean; lastReceivedAt: string | null; lastError: string | null };
-  pairing: {
-    paired: boolean;
-    chat: { username: string | null; firstName: string | null; pairedAt: string } | null;
-  };
-  createdAt: string;
-  updatedAt: string;
-};
-
-export type TelegramPairing = {
-  url: string;
-  code: string;
-  expiresAt: string;
-};
-
-function requiredString(record: Record<string, unknown>, key: string): string {
-  const value = record[key];
-  if (typeof value !== "string") throw new Error("Telegram connection response was incomplete.");
-  return value;
-}
-
-function nullableString(record: Record<string, unknown>, key: string): string | null {
-  const value = record[key];
-  if (typeof value !== "string" && value !== null) throw new Error("Telegram connection response was incomplete.");
-  return value;
-}
-
-function parseTelegramConnectionValue(value: unknown): TelegramConnection {
-  if (!isRecord(value) || !isRecord(value.bot) || !isRecord(value.worker) || !isRecord(value.webhook) || !isRecord(value.pairing)) {
-    throw new Error("Telegram connection response was incomplete.");
-  }
-  const { bot, worker, webhook, pairing } = value;
-  const chat = pairing.chat;
-  if (
-    (value.status !== "active" && value.status !== "error")
-    || typeof value.connected !== "boolean"
-    || typeof webhook.registered !== "boolean"
-    || typeof pairing.paired !== "boolean"
-    || (chat !== null && !isRecord(chat))
-  ) {
-    throw new Error("Telegram connection response was incomplete.");
-  }
-  return {
-    id: requiredString(value, "id"),
-    status: value.status,
-    connected: value.connected,
-    bot: {
-      id: requiredString(bot, "id"),
-      username: nullableString(bot, "username"),
-      displayName: requiredString(bot, "displayName"),
-    },
-    worker: {
-      id: requiredString(worker, "id"),
-      name: requiredString(worker, "name"),
-      status: requiredString(worker, "status"),
-    },
-    webhook: {
-      registered: webhook.registered,
-      lastReceivedAt: nullableString(webhook, "lastReceivedAt"),
-      lastError: nullableString(webhook, "lastError"),
-    },
-    pairing: {
-      paired: pairing.paired,
-      chat: chat === null ? null : {
-        username: nullableString(chat, "username"),
-        firstName: nullableString(chat, "firstName"),
-        pairedAt: requiredString(chat, "pairedAt"),
-      },
-    },
-    createdAt: requiredString(value, "createdAt"),
-    updatedAt: requiredString(value, "updatedAt"),
-  };
-}
-
-function parseTelegramConnectionPayload(payload: unknown): TelegramConnection | null {
-  if (!isRecord(payload) || !("connection" in payload)) {
-    throw new Error("Telegram connection response was incomplete.");
-  }
-  return payload.connection === null ? null : parseTelegramConnectionValue(payload.connection);
-}
-
-export function useTelegramConnection(enabled: boolean) {
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useQuery({
-    enabled: enabled && Boolean(orgId),
-    queryKey: mcpConnectionQueryKeys.telegram(orgId),
-    retry: false,
-    queryFn: async (): Promise<TelegramConnection | null> => {
-      let connection: TelegramConnection | null = null;
-      let loaded = false;
-      await runReauthableAction("load-telegram-connection", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection",
-          { headers: getOrgScopeHeaders(requireOrgId(orgId)) },
-          15000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to load Telegram (${response.status}).`);
-        connection = parseTelegramConnectionPayload(payload);
-        loaded = true;
-      });
-      if (!loaded) throw new Error("Telegram connection response was incomplete.");
-      return connection;
-    },
-  });
-}
-
-export function useSaveTelegramConnection() {
-  const queryClient = useQueryClient();
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useMutation({
-    mutationFn: async (input: { botToken: string; workerId: string }): Promise<TelegramConnection> => {
-      let connection: TelegramConnection | null = null;
-      await runReauthableAction("save-telegram-connection", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection",
-          { method: "PUT", headers: getOrgScopeHeaders(requireOrgId(orgId)), body: JSON.stringify(input) },
-          30000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to connect Telegram (${response.status}).`);
-        connection = parseTelegramConnectionPayload(payload);
-      });
-      if (!connection) throw new Error("Telegram connection response was incomplete.");
-      return connection;
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.telegram(orgId) }),
-  });
-}
-
-export function useCreateTelegramPairing() {
-  const queryClient = useQueryClient();
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useMutation({
-    mutationFn: async (): Promise<TelegramPairing> => {
-      let pairing: TelegramPairing | null = null;
-      await runReauthableAction("create-telegram-pairing", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection/pairing",
-          { method: "POST", headers: getOrgScopeHeaders(requireOrgId(orgId)), body: JSON.stringify({}) },
-          15000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to create Telegram pairing (${response.status}).`);
-        if (!isRecord(payload) || !isRecord(payload.pairing)) throw new Error("Telegram pairing response was incomplete.");
-        pairing = {
-          url: requiredString(payload.pairing, "url"),
-          code: requiredString(payload.pairing, "code"),
-          expiresAt: requiredString(payload.pairing, "expiresAt"),
-        };
-      });
-      if (!pairing) throw new Error("Telegram pairing response was incomplete.");
-      return pairing;
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.telegram(orgId) }),
-  });
-}
-
-export function useDeleteTelegramConnection() {
-  const queryClient = useQueryClient();
-  const { orgId, runReauthableAction } = useOrgDashboard();
-  return useMutation({
-    mutationFn: async (): Promise<void> => {
-      await runReauthableAction("delete-telegram-connection", async () => {
-        const { response, payload } = await requestJson(
-          "/v1/telegram/connection",
-          { method: "DELETE", headers: getOrgScopeHeaders(requireOrgId(orgId)) },
-          20000,
-        );
-        if (!response.ok) throw getRequestError(payload, response, `Failed to disconnect Telegram (${response.status}).`);
-      });
-    },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: mcpConnectionQueryKeys.telegram(orgId) }),
   });
 }
 

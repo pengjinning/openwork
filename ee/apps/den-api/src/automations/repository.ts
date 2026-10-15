@@ -1,9 +1,13 @@
+import { createHash } from "node:crypto"
 import {
   AUTOMATION_DEFAULT_MAXIMUM_RUNTIME_MS,
   AUTOMATION_FREE_MODEL,
   AUTOMATION_MAXIMUM_ATTEMPTS,
   automationOccurrenceIdentity,
   automationRevisionDigest,
+  computeAutomationClaimDeadline,
+  desktopRunnerConnected,
+  missedDesktopRunMessage,
   nextAutomationOccurrence,
 } from "@openwork/automations"
 import type {
@@ -11,17 +15,21 @@ import type {
   AutomationListItem,
   AutomationRepository,
 } from "@openwork/automations"
+import { REMOTE_SESSION_ONLY_RUNNER_CAPABILITY } from "@openwork/types/automations"
 import type {
   Automation,
   AutomationAction,
+  AutomationDesktopRunnerCapability,
   AutomationError,
+  AutomationExecutionTarget,
   AutomationRevision,
   AutomationRun,
   AutomationRunEvent,
   AutomationRunEventType,
   AutomationUsage,
+  DesktopRunnerInventory,
 } from "@openwork/types/automations"
-import { and, asc, desc, eq, gt, inArray, lt, lte, sql } from "@openwork-ee/den-db/drizzle"
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or, sql } from "@openwork-ee/den-db/drizzle"
 import {
   AutomationRevisionTable,
   AutomationRunnerTable,
@@ -32,7 +40,8 @@ import {
 } from "@openwork-ee/den-db/schema"
 import { createDenTypeId, normalizeDenTypeId } from "@openwork-ee/utils/typeid"
 import { db } from "../db.js"
-import { automationUpdateChangedRows } from "./update-result.js"
+import { appLogger } from "../observability/logger.js"
+import { automationAffectedRows, automationUpdateChangedRows } from "./update-result.js"
 import { cloudArtifactStateUpdate } from "./cloud-artifact-state.js"
 
 type AutomationRow = typeof AutomationTable.$inferSelect
@@ -41,7 +50,12 @@ type RunRow = typeof AutomationRunTable.$inferSelect
 type EventRow = typeof AutomationRunEventTable.$inferSelect
 type DesktopClaim = { automation: Automation; revision: AutomationRevision; run: AutomationRun }
 
+/** Upper bound for one calendar range read across an owner's Automations. */
+export const AUTOMATION_RUN_RANGE_MAX_ITEMS = 500
+
+const logger = appLogger.child({ component: "automation_repository" })
 const emptyUsage: AutomationUsage = { inputTokens: null, outputTokens: null, costMicros: null }
+const interruptedDesktopRunMessage = "Run interrupted — the desktop execution lease expired."
 
 const normalizeAutomationId = (value: string) => normalizeDenTypeId("automation", value)
 const normalizeRevisionId = (value: string) => normalizeDenTypeId("automationRevision", value)
@@ -51,6 +65,42 @@ const normalizeMemberId = (value: string) => normalizeDenTypeId("member", value)
 
 const ms = (value: Date | null): number | null => value?.getTime() ?? null
 const date = (value: number | null): Date | null => value === null ? null : new Date(value)
+const idPrefix = (value: string) => value.slice(0, 8)
+
+/**
+ * Runner rows are keyed per organization, member, and desktop install, so one
+ * install signed in to several organizations is a runner in each and a member
+ * can register any number of desktops. The install's own id keeps naming the
+ * runner in its credential and run leases. Rows from before this used the
+ * install id alone; registering again replaces such a row.
+ */
+export function automationRunnerRowId(input: { organizationId: string; ownerMemberId: string; runnerId: string }) {
+  const scope = `${normalizeOrganizationId(input.organizationId)}\n${normalizeMemberId(input.ownerMemberId)}\n${input.runnerId}`
+  return `rnr_${createHash("sha256").update(scope).digest("hex")}`
+}
+
+/**
+ * Every id a runner's computer can be targeted by: its scoped row id, which
+ * callers see as `computerId`, and the bare install id that named rows
+ * registered before rows were scoped.
+ */
+export function automationRunnerComputerIds(input: { organizationId: string; ownerMemberId: string; runnerId: string }) {
+  return [automationRunnerRowId(input), input.runnerId]
+}
+
+/**
+ * A pinned workspace names a folder on the kind of computer its revision
+ * targets. A run moved once to the other target ignores the pin: a desktop
+ * folder does not exist on a cloud computer, nor the reverse.
+ */
+export function runWorkspaceId(
+  revision: { executionTarget?: AutomationExecutionTarget | null; workspaceId?: string | null },
+  runTarget: AutomationExecutionTarget,
+): string | null {
+  return (revision.executionTarget ?? "desktop") === runTarget ? revision.workspaceId ?? null : null
+}
+
+const pinnedWorkspaceMissedMessage = "Missed — no connected desktop has this Automation's workspace."
 
 function mapAutomation(row: AutomationRow): Automation {
   return {
@@ -86,6 +136,7 @@ function mapRevision(row: RevisionRow): AutomationRevision {
     model: { providerId: row.provider_id, modelId: row.model_id, variant: row.model_variant ?? null },
     action,
     executionTarget: row.execution_target,
+    workspaceId: row.workspace_id ?? null,
     maximumRuntimeMs: row.maximum_runtime_ms,
     digest: row.digest,
     createdAt: row.created_at.getTime(),
@@ -93,7 +144,7 @@ function mapRevision(row: RevisionRow): AutomationRevision {
 }
 
 function mapRun(row: RunRow): AutomationRun {
-  const receipt = row.execution_target === "cloud" && typeof row.engine_receipt === "object" && row.engine_receipt !== null
+  const receipt = typeof row.engine_receipt === "object" && row.engine_receipt !== null
     ? row.engine_receipt as Record<string, unknown>
     : null
   const nativeThreadId = typeof receipt?.nativeThreadId === "string" ? receipt.nativeThreadId : null
@@ -146,8 +197,9 @@ function normalizedDefinition(definition: Parameters<AutomationRepository["creat
       schedule: definition.schedule,
       action: definition.action,
       executionTarget: definition.executionTarget,
-      instructions: definition.action.kind === "agent" ? definition.action.instructions : "Execute the pinned saved Code Mode script.",
+      instructions: definition.action.kind === "agent" ? definition.action.instructions : "Execute the pinned Workflow.",
       model,
+      workspaceId: null,
     }
   }
   return {
@@ -157,6 +209,7 @@ function normalizedDefinition(definition: Parameters<AutomationRepository["creat
     executionTarget: "desktop" as const,
     instructions: definition.instructions,
     model: definition.model,
+    workspaceId: definition.workspaceId ?? null,
   }
 }
 
@@ -183,6 +236,53 @@ async function itemFromRows(automation: AutomationRow, revision: RevisionRow): P
   return { automation: mapAutomation(automation), revision: mapRevision(revision), latestRun: await latestRun(automation.id) }
 }
 
+async function itemsFromRows(automations: AutomationRow[]): Promise<AutomationListItem[]> {
+  if (automations.length === 0) return []
+
+  const latestRunConditions = automations.flatMap((automation) => automation.latest_run_at
+    ? [and(
+        eq(AutomationRunTable.automation_id, automation.id),
+        eq(AutomationRunTable.created_at, automation.latest_run_at),
+      )]
+    : [])
+  const [revisions, latestRuns] = await Promise.all([
+    db.select().from(AutomationRevisionTable).where(inArray(
+      AutomationRevisionTable.id,
+      automations.map((automation) => automation.current_revision_id),
+    )),
+    latestRunConditions.length === 0
+      ? Promise.resolve([])
+      : db.select().from(AutomationRunTable)
+          .where(or(...latestRunConditions))
+          .orderBy(desc(AutomationRunTable.created_at), desc(AutomationRunTable.id)),
+  ])
+  const revisionById = new Map(revisions.map((revision) => [revision.id, revision]))
+  const latestRunByAutomationId = new Map<string, RunRow>()
+  for (const run of latestRuns) {
+    if (!latestRunByAutomationId.has(run.automation_id)) {
+      latestRunByAutomationId.set(run.automation_id, run)
+    }
+  }
+
+  return automations.map((automation) => {
+    const revision = revisionById.get(automation.current_revision_id)
+    if (!revision) throw new Error("automation_revision_not_found")
+    const run = latestRunByAutomationId.get(automation.id)
+    return {
+      automation: mapAutomation(automation),
+      revision: mapRevision(revision),
+      latestRun: run ? mapRun(run) : null,
+    }
+  })
+}
+
+/** MySQL asked the transaction to be restarted: a deadlock victim or a lock wait that timed out. */
+function isLockConflict(error: unknown): boolean {
+  const cause = typeof error === "object" && error !== null && "cause" in error ? error.cause : error
+  return typeof cause === "object" && cause !== null && "code" in cause
+    && (cause.code === "ER_LOCK_DEADLOCK" || cause.code === "ER_LOCK_WAIT_TIMEOUT")
+}
+
 export class DenAutomationRepository implements AutomationRepository {
   async listQueuedCloud(input: { limit: number }): Promise<string[]> {
     const rows = await db.select({ id: AutomationRunTable.id }).from(AutomationRunTable).where(and(
@@ -204,6 +304,7 @@ export class DenAutomationRepository implements AutomationRepository {
       action: definition.action,
       executionTarget: definition.executionTarget,
       maximumRuntimeMs,
+      ...(definition.workspaceId ? { workspaceId: definition.workspaceId } : {}),
     })
     const nextDueAt = nextAutomationOccurrence(definition.schedule, input.now)
     await db.transaction(async (tx) => {
@@ -220,6 +321,7 @@ export class DenAutomationRepository implements AutomationRepository {
         model_variant: definition.model.variant ?? null,
         action: definition.action,
         execution_target: definition.executionTarget,
+        workspace_id: definition.workspaceId,
         maximum_runtime_ms: maximumRuntimeMs,
         digest,
         created_at: now,
@@ -272,12 +374,19 @@ export class DenAutomationRepository implements AutomationRepository {
             model: input.changes.model ?? currentAction.model,
           }
         : currentAction)
-      const executionTarget = current.execution_target
-      const instructions = action.kind === "agent" ? action.instructions : "Execute the pinned saved Code Mode script."
+      // The service validated the move; a Workflow never reaches the desktop.
+      const executionTarget = input.changes.executionTarget ?? current.execution_target
+      if (executionTarget === "desktop" && action.kind === "saved_script") throw new Error("automation_action_target_mismatch")
+      const instructions = action.kind === "agent" ? action.instructions : "Execute the pinned Workflow."
       const schedule = input.changes.schedule ?? current.schedule_config
       const model = action.kind === "agent"
         ? action.model
         : { providerId: AUTOMATION_FREE_MODEL.providerId, modelId: AUTOMATION_FREE_MODEL.modelId, variant: null }
+      // A pin names a folder on one computer, so moving the Automation drops it
+      // unless the same request pins a workspace on the new target.
+      const workspaceId = input.changes.workspaceId !== undefined
+        ? input.changes.workspaceId
+        : executionTarget === current.execution_target ? current.workspace_id ?? null : null
       const newRevisionId = createDenTypeId("automationRevision")
       const digest = automationRevisionDigest({
         instructions,
@@ -286,6 +395,7 @@ export class DenAutomationRepository implements AutomationRepository {
         action,
         executionTarget,
         maximumRuntimeMs: current.maximum_runtime_ms,
+        ...(workspaceId ? { workspaceId } : {}),
       })
       if (digest === current.digest) {
         await tx.update(AutomationTable).set({
@@ -307,6 +417,7 @@ export class DenAutomationRepository implements AutomationRepository {
         model_variant: model.variant ?? null,
         action,
         execution_target: executionTarget,
+        workspace_id: workspaceId,
         maximum_runtime_ms: current.maximum_runtime_ms,
         digest,
         created_at: new Date(input.now),
@@ -335,13 +446,10 @@ export class DenAutomationRepository implements AutomationRepository {
     const rows = await db.select().from(AutomationTable).where(and(...conditions))
       .orderBy(desc(AutomationTable.id)).limit(limit + 1)
     const selected = rows.slice(0, limit)
-    const items = await Promise.all(selected.map(async (automation) => {
-      const revisions = await db.select().from(AutomationRevisionTable)
-        .where(eq(AutomationRevisionTable.id, automation.current_revision_id)).limit(1)
-      if (!revisions[0]) throw new Error("automation_revision_not_found")
-      return itemFromRows(automation, revisions[0])
-    }))
-    return { items: await Promise.all(items), nextCursor: rows.length > limit ? selected.at(-1)?.id ?? null : null }
+    return {
+      items: await itemsFromRows(selected),
+      nextCursor: rows.length > limit ? selected.at(-1)?.id ?? null : null,
+    }
   }
 
   async get(input: Parameters<AutomationRepository["get"]>[0]): Promise<AutomationListItem | null> {
@@ -379,12 +487,7 @@ export class DenAutomationRepository implements AutomationRepository {
       eq(AutomationTable.state, "active"),
       lte(AutomationTable.next_due_at, new Date(input.now)),
     )).orderBy(asc(AutomationTable.next_due_at), asc(AutomationTable.id)).limit(input.limit)
-    return Promise.all(rows.map(async (automation) => {
-      const revisions = await db.select().from(AutomationRevisionTable)
-        .where(eq(AutomationRevisionTable.id, automation.current_revision_id)).limit(1)
-      if (!revisions[0]) throw new Error("automation_revision_not_found")
-      return itemFromRows(automation, revisions[0])
-    }))
+    return itemsFromRows(rows)
   }
 
   async claim(input: Parameters<AutomationRepository["claim"]>[0]): Promise<AutomationClaimResult> {
@@ -414,6 +517,12 @@ export class DenAutomationRepository implements AutomationRepository {
       const nextDueAt = input.trigger === "manual"
         ? input.automation.nextDueAt
         : nextAutomationOccurrence(input.revision.schedule, input.scheduledFor ?? input.now)
+      const claimDeadlineAt = computeAutomationClaimDeadline({
+        trigger: input.trigger,
+        now: input.now,
+        windowMs: input.claimDeadlineMs ?? input.leaseMs,
+        nextDueAt,
+      })
       await tx.insert(AutomationRunTable).values({
         id: newRunId,
         automation_id: normalizeAutomationId(input.automation.id),
@@ -423,7 +532,7 @@ export class DenAutomationRepository implements AutomationRepository {
         idempotency_key: identity.idempotencyKey,
         status: overlap ? "skipped" : "queued",
         execution_target: input.revision.executionTarget ?? "desktop",
-        claim_deadline_at: overlap ? null : new Date(input.now + (input.claimDeadlineMs ?? input.leaseMs)),
+        claim_deadline_at: overlap ? null : new Date(claimDeadlineAt),
         lease_owner: null,
         lease_expires_at: null,
         heartbeat_at: null,
@@ -532,14 +641,79 @@ export class DenAutomationRepository implements AutomationRepository {
     })
   }
 
-  async claimCloud(input: { runId: string; leaseOwner: string; leaseMs: number; maxConcurrency: number; now: number }): Promise<DesktopClaim | null> {
+  /** What a queued cloud run needs before it is claimed: whose it is, and which engine already owns it. */
+  async cloudRunTarget(runId: string): Promise<{
+    organizationId: string
+    ownerMemberId: string
+    actionKind: "agent" | "saved_script" | null
+    engineKind: string | null
+    model: { providerId: string; modelId: string }
+  } | null> {
+    const rows = await db.select({
+      organizationId: AutomationTable.organization_id,
+      ownerMemberId: AutomationTable.owner_member_id,
+      engineKind: AutomationRunTable.engine_kind,
+      providerId: AutomationRunTable.provider_id,
+      modelId: AutomationRunTable.model_id,
+      action: AutomationRevisionTable.action,
+    }).from(AutomationRunTable)
+      .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+      .innerJoin(AutomationRevisionTable, eq(AutomationRevisionTable.id, AutomationRunTable.revision_id))
+      .where(and(eq(AutomationRunTable.id, normalizeRunId(runId)), eq(AutomationRunTable.execution_target, "cloud")))
+      .limit(1)
+    const row = rows[0]
+    if (!row) return null
+    return {
+      organizationId: row.organizationId,
+      ownerMemberId: row.ownerMemberId,
+      actionKind: row.action?.kind ?? null,
+      engineKind: row.engineKind ?? null,
+      model: { providerId: row.providerId, modelId: row.modelId },
+    }
+  }
+
+  /**
+   * `engineKind` selects the concurrency pool: headless runs only count
+   * against other headless runs, so they never wait on OpenWork Web slots
+   * and never take them.
+   */
+  async claimCloud(input: {
+    runId: string
+    leaseOwner: string
+    leaseMs: number
+    maxConcurrency: number
+    engineKind?: string
+    headlessEngineKind?: string
+    now: number
+  }): Promise<DesktopClaim | null> {
+    // Claims started together serialize on the same locked ranges, so MySQL
+    // may pick one as a deadlock victim and ask to restart it. Restarting
+    // right away keeps that run from waiting a whole scheduler tick.
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        return await this.claimCloudOnce(input)
+      } catch (error) {
+        if (attempt >= 3 || !isLockConflict(error)) throw error
+        await new Promise((resolve) => setTimeout(resolve, 15 * attempt + Math.random() * 25))
+      }
+    }
+  }
+
+  private async claimCloudOnce(input: Parameters<DenAutomationRepository["claimCloud"]>[0]): Promise<DesktopClaim | null> {
     return db.transaction(async (tx) => {
       // Admission and the queued -> running transition share one transaction.
       // Locking the active status ranges serializes competing replicas even
       // when there are currently no active rows (InnoDB next-key locking).
+      const headless = input.headlessEngineKind ?? null
+      const pool = headless === null
+        ? undefined
+        : input.engineKind === headless
+          ? eq(AutomationRunTable.engine_kind, headless)
+          : or(isNull(AutomationRunTable.engine_kind), ne(AutomationRunTable.engine_kind, headless))
       const active = await tx.select({ id: AutomationRunTable.id }).from(AutomationRunTable).where(and(
         eq(AutomationRunTable.execution_target, "cloud"),
         inArray(AutomationRunTable.status, ["claimed", "running"]),
+        pool,
       )).limit(input.maxConcurrency).for("update")
       if (active.length >= input.maxConcurrency) return null
       const rows = await tx.select({ run: AutomationRunTable, automation: AutomationTable })
@@ -558,7 +732,7 @@ export class DenAutomationRepository implements AutomationRepository {
       if (!revision) return null
       const engineKind = revision.action?.kind === "saved_script"
         ? "openwork-cloud-codemode-v1"
-        : "openwork-cloud-agent-v1"
+        : input.engineKind ?? "openwork-cloud-agent-v1"
       await tx.update(AutomationRunTable).set({
         status: "running",
         lease_owner: input.leaseOwner,
@@ -649,7 +823,7 @@ export class DenAutomationRepository implements AutomationRepository {
       now: input.now,
     })
     await db.update(AutomationRunTable).set({
-      codemode_receipt_id: input.codemodeReceiptId ? normalizeDenTypeId("codemodeRun", input.codemodeReceiptId) : null,
+      codemode_receipt_id: input.codemodeReceiptId ? normalizeDenTypeId("workflowRun", input.codemodeReceiptId) : null,
       validated_result: input.validatedResult,
       updated_at: new Date(input.now),
     }).where(eq(AutomationRunTable.id, normalizeRunId(input.runId)))
@@ -752,6 +926,7 @@ export class DenAutomationRepository implements AutomationRepository {
         result_summary: input.resultSummary,
         usage: input.usage,
         error: input.error,
+        ...(input.engineReceipt === undefined ? {} : { engine_receipt: input.engineReceipt }),
         finished_at: new Date(input.now),
         lease_expires_at: null,
         heartbeat_at: new Date(input.now),
@@ -787,7 +962,12 @@ export class DenAutomationRepository implements AutomationRepository {
         mcp_token_hash: null,
         mcp_token_expires_at: null,
         engine_sequence: retry ? 0 : run.engine_sequence,
-        error: retry ? null : { code: "lease_lost", message: "The execution lease expired.", retryable: false },
+        error: retry ? null : {
+          code: "lease_lost",
+          message: run.execution_target === "desktop" ? interruptedDesktopRunMessage : "The execution lease expired.",
+          retryable: false,
+        },
+        ...(!retry && run.execution_target === "desktop" ? { result_summary: interruptedDesktopRunMessage } : {}),
         finished_at: retry ? null : new Date(input.now),
         updated_at: new Date(input.now),
       }).where(and(
@@ -835,54 +1015,130 @@ export class DenAutomationRepository implements AutomationRepository {
     runnerId: string
     protocolVersion: number
     supportedExecutionTargets: Array<"desktop">
+    capabilities: AutomationDesktopRunnerCapability[]
     appVersion: string
     platform: "darwin" | "win32" | "linux"
     concurrency: number
     now: number
   }) {
     const now = new Date(input.now)
+    const organizationId = normalizeOrganizationId(input.organizationId)
+    const ownerMemberId = normalizeMemberId(input.ownerMemberId)
+    const id = automationRunnerRowId(input)
     const existing = await db.select({ organizationId: AutomationRunnerTable.organization_id, ownerMemberId: AutomationRunnerTable.owner_member_id })
-      .from(AutomationRunnerTable).where(eq(AutomationRunnerTable.id, input.runnerId)).limit(1)
+      .from(AutomationRunnerTable).where(eq(AutomationRunnerTable.id, id)).limit(1)
+    // The row id hashes its own scope, so this only trips on a row that took
+    // the id under the old install-id keying for someone else.
     if (existing[0] && (
-      existing[0].organizationId !== normalizeOrganizationId(input.organizationId)
-      || existing[0].ownerMemberId !== normalizeMemberId(input.ownerMemberId)
+      existing[0].organizationId !== organizationId
+      || existing[0].ownerMemberId !== ownerMemberId
     )) throw new Error("automation_runner_identity_conflict")
-    await db.insert(AutomationRunnerTable).values({
-      id: input.runnerId,
-      organization_id: normalizeOrganizationId(input.organizationId),
-      owner_member_id: normalizeMemberId(input.ownerMemberId),
-      protocol_version: input.protocolVersion,
-      supported_execution_targets: input.supportedExecutionTargets,
-      app_version: input.appVersion,
-      platform: input.platform,
-      concurrency: input.concurrency,
-      last_seen_at: now,
-      created_at: now,
-      updated_at: now,
-    }).onDuplicateKeyUpdate({ set: {
-      protocol_version: input.protocolVersion,
-      supported_execution_targets: input.supportedExecutionTargets,
-      app_version: input.appVersion,
-      platform: input.platform,
-      concurrency: input.concurrency,
-      last_seen_at: now,
-      updated_at: now,
-    } })
+    try {
+      await db.insert(AutomationRunnerTable).values({
+        id,
+        organization_id: organizationId,
+        owner_member_id: ownerMemberId,
+        protocol_version: input.protocolVersion,
+        supported_execution_targets: input.supportedExecutionTargets,
+        capabilities: input.capabilities,
+        app_version: input.appVersion,
+        platform: input.platform,
+        concurrency: input.concurrency,
+        last_seen_at: now,
+        created_at: now,
+        updated_at: now,
+      }).onDuplicateKeyUpdate({ set: {
+        protocol_version: input.protocolVersion,
+        supported_execution_targets: input.supportedExecutionTargets,
+        capabilities: input.capabilities,
+        app_version: input.appVersion,
+        platform: input.platform,
+        concurrency: input.concurrency,
+        last_seen_at: now,
+        updated_at: now,
+      } })
+    } catch (error) {
+      logger.error("automation runner registration upsert failed", {
+        error,
+        runner_id_prefix: idPrefix(input.runnerId),
+        runner_id_length: input.runnerId.length,
+        organization_id: organizationId,
+        owner_member_id: ownerMemberId,
+        existing_runner: existing[0] ? "same_owner" : "none",
+        protocol_version: input.protocolVersion,
+        supported_execution_targets: input.supportedExecutionTargets.join(","),
+        supported_execution_target_count: input.supportedExecutionTargets.length,
+        capabilities: input.capabilities.join(","),
+        capability_count: input.capabilities.length,
+        app_version_length: input.appVersion.length,
+        platform: input.platform,
+        concurrency: input.concurrency,
+      })
+      throw error
+    }
+    // This desktop's row from before rows were scoped, if any: replace it so
+    // the same desktop is never listed twice.
+    await db.delete(AutomationRunnerTable).where(and(
+      eq(AutomationRunnerTable.id, input.runnerId),
+      eq(AutomationRunnerTable.organization_id, organizationId),
+      eq(AutomationRunnerTable.owner_member_id, ownerMemberId),
+    ))
   }
 
   async touchDesktopRunner(input: { organizationId: string; ownerMemberId: string; runnerId: string; now: number }) {
     await db.update(AutomationRunnerTable).set({ last_seen_at: new Date(input.now), updated_at: new Date(input.now) })
       .where(and(
-        eq(AutomationRunnerTable.id, input.runnerId),
+        // A desktop still holding a pre-scoping registration keeps its presence
+        // until it registers again (at most one refresh interval).
+        inArray(AutomationRunnerTable.id, [automationRunnerRowId(input), input.runnerId]),
         eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
         eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
       ))
   }
 
-  async discoverDesktopWork(input: { organizationId: string; ownerMemberId: string; now: number; limit: number }) {
-    const rows = await db.select({ runId: AutomationRunTable.id, executionTarget: AutomationRunTable.execution_target })
+  /**
+   * Stores the runner's latest computer, workspace and model report. Returns
+   * false when the runner has no row, so it must register again first.
+   */
+  async saveDesktopRunnerInventory(input: {
+    organizationId: string
+    ownerMemberId: string
+    runnerId: string
+    inventory: DesktopRunnerInventory
+    now: number
+  }): Promise<boolean> {
+    const now = new Date(input.now)
+    const result = await db.update(AutomationRunnerTable).set({
+      inventory: input.inventory,
+      inventory_updated_at: now,
+      last_seen_at: now,
+      updated_at: now,
+    }).where(and(
+      inArray(AutomationRunnerTable.id, automationRunnerComputerIds(input)),
+      eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
+      eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+    ))
+    return automationAffectedRows(result) > 0
+  }
+
+  /**
+   * Queued desktop runs, oldest first. Every one of the owner's desktops sees
+   * the same list; a run pinned to a workspace says so, and only a desktop
+   * that has that workspace claims it.
+   */
+  async discoverDesktopWork(input: { organizationId: string; ownerMemberId: string; now: number; limit: number }): Promise<Array<{
+    runId: string
+    executionTarget: "desktop"
+    workspaceId?: string
+  }>> {
+    const rows = await db.select({
+      runId: AutomationRunTable.id,
+      revisionTarget: AutomationRevisionTable.execution_target,
+      workspaceId: AutomationRevisionTable.workspace_id,
+    })
       .from(AutomationRunTable)
       .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+      .innerJoin(AutomationRevisionTable, eq(AutomationRevisionTable.id, AutomationRunTable.revision_id))
       .where(and(
         eq(AutomationTable.organization_id, normalizeOrganizationId(input.organizationId)),
         eq(AutomationTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
@@ -890,7 +1146,11 @@ export class DenAutomationRepository implements AutomationRepository {
         eq(AutomationRunTable.execution_target, "desktop"),
         gt(AutomationRunTable.claim_deadline_at, new Date(input.now)),
       )).orderBy(asc(AutomationRunTable.created_at), asc(AutomationRunTable.id)).limit(input.limit)
-    return rows
+    return rows.map((row) => {
+      const workspaceId = runWorkspaceId({ executionTarget: row.revisionTarget, workspaceId: row.workspaceId }, "desktop")
+      // Unpinned items keep their original two-field shape for released runners.
+      return { runId: row.runId, executionTarget: "desktop", ...(workspaceId ? { workspaceId } : {}) }
+    })
   }
 
   async claimDesktop(input: {
@@ -1066,10 +1326,45 @@ export class DenAutomationRepository implements AutomationRepository {
     )).orderBy(asc(AutomationRunnerNotificationTable.id)).limit(input.limit)
   }
 
+  /**
+   * Forgets desktops that stopped checking in and wake-up notifications nobody
+   * needs anymore (a runner's work poll, not an old hint, finds its work).
+   * Each step removes at most `limit` rows and reports how many it removed.
+   */
+  async pruneRunnerState(input: { runnersSeenBefore: number; notificationsBefore: number; limit: number }): Promise<{
+    runners: number
+    notifications: number
+  }> {
+    const runners = automationAffectedRows(await db.delete(AutomationRunnerTable)
+      .where(lt(AutomationRunnerTable.last_seen_at, new Date(input.runnersSeenBefore)))
+      .limit(input.limit))
+    // Notification ids grow with time, so expired rows sit at the low end of
+    // the primary key: look at one bounded window of the oldest ids instead
+    // of scanning the table by timestamp, and delete what expired within it.
+    const oldest = await db.select({ id: AutomationRunnerNotificationTable.id, createdAt: AutomationRunnerNotificationTable.created_at })
+      .from(AutomationRunnerNotificationTable)
+      .orderBy(asc(AutomationRunnerNotificationTable.id))
+      .limit(input.limit)
+    const expired = oldest.filter((row) => row.createdAt.getTime() < input.notificationsBefore)
+    const lastExpired = expired.at(-1)
+    const notifications = lastExpired === undefined ? 0 : automationAffectedRows(await db.delete(AutomationRunnerNotificationTable).where(and(
+      lte(AutomationRunnerNotificationTable.id, lastExpired.id),
+      lt(AutomationRunnerNotificationTable.created_at, new Date(input.notificationsBefore)),
+    )))
+    return { runners, notifications }
+  }
+
+  /** Where a revision runs, so a one-off run on the other target can be told apart. */
+  async revisionExecutionTarget(revisionId: string): Promise<AutomationExecutionTarget | null> {
+    const rows = await db.select({ executionTarget: AutomationRevisionTable.execution_target })
+      .from(AutomationRevisionTable).where(eq(AutomationRevisionTable.id, normalizeRevisionId(revisionId))).limit(1)
+    return rows[0]?.executionTarget ?? null
+  }
+
   /** Durably skips a run that must not execute (e.g. revoked model access). */
   async skipRun(input: {
     runId: string
-    code: "owner_membership_lost" | "model_access_lost" | "provider_unavailable"
+    code: "owner_membership_lost" | "model_access_lost" | "provider_unavailable" | "openwork_web_access_required"
     message: string
     now: number
   }): Promise<void> {
@@ -1087,28 +1382,169 @@ export class DenAutomationRepository implements AutomationRepository {
     ))
   }
 
+  /** Latest moment any of this owner's desktop runners registered or asked for work. */
+  async desktopRunnerLastSeenAt(input: { organizationId: string; ownerMemberId: string }): Promise<number | null> {
+    const rows = await db.select({ lastSeenAt: AutomationRunnerTable.last_seen_at })
+      .from(AutomationRunnerTable)
+      .where(and(
+        eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
+        eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+        sql`not coalesce(json_contains(${AutomationRunnerTable.capabilities}, ${JSON.stringify(REMOTE_SESSION_ONLY_RUNNER_CAPABILITY)}), false)`,
+      )).orderBy(desc(AutomationRunnerTable.last_seen_at)).limit(1)
+    return rows[0]?.lastSeenAt?.getTime() ?? null
+  }
+
+  /**
+   * Latest registration for one capability across all of the owner's
+   * desktops, however many there are; legacy runner rows have no capabilities.
+   */
+  async desktopRunnerCapabilityLastSeenAt(input: {
+    organizationId: string
+    ownerMemberId: string
+    capability: AutomationDesktopRunnerCapability
+  }): Promise<number | null> {
+    const rows = await db.select({ lastSeenAt: AutomationRunnerTable.last_seen_at })
+      .from(AutomationRunnerTable).where(and(
+        eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
+        eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+        sql`json_contains(${AutomationRunnerTable.capabilities}, ${JSON.stringify(input.capability)})`,
+      )).orderBy(desc(AutomationRunnerTable.last_seen_at)).limit(1)
+    return rows[0]?.lastSeenAt.getTime() ?? null
+  }
+
+  /**
+   * The owner's desktops that can take remote sessions, most recently seen
+   * first, with their latest inventory report (null for desktops that never
+   * sent one).
+   */
+  async listRemoteSessionDesktops(input: {
+    organizationId: string
+    ownerMemberId: string
+    capability: AutomationDesktopRunnerCapability
+    limit: number
+  }) {
+    const rows = await db.select({
+      id: AutomationRunnerTable.id,
+      platform: AutomationRunnerTable.platform,
+      appVersion: AutomationRunnerTable.app_version,
+      lastSeenAt: AutomationRunnerTable.last_seen_at,
+      capabilities: AutomationRunnerTable.capabilities,
+      inventory: AutomationRunnerTable.inventory,
+    }).from(AutomationRunnerTable).where(and(
+      eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
+      eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+      sql`json_contains(${AutomationRunnerTable.capabilities}, ${JSON.stringify(input.capability)})`,
+    )).orderBy(desc(AutomationRunnerTable.last_seen_at)).limit(input.limit)
+    return rows.map((row) => ({ ...row, capabilities: row.capabilities ?? [] }))
+  }
+
+  /** The owner's registered desktops, most recently seen first. */
+  async listDesktopRunners(input: { organizationId: string; ownerMemberId: string; limit: number }) {
+    return db.select({
+      id: AutomationRunnerTable.id,
+      platform: AutomationRunnerTable.platform,
+      appVersion: AutomationRunnerTable.app_version,
+      lastSeenAt: AutomationRunnerTable.last_seen_at,
+    }).from(AutomationRunnerTable).where(and(
+      eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
+      eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+      sql`not coalesce(json_contains(${AutomationRunnerTable.capabilities}, ${JSON.stringify(REMOTE_SESSION_ONLY_RUNNER_CAPABILITY)}), false)`,
+    )).orderBy(desc(AutomationRunnerTable.last_seen_at)).limit(input.limit)
+  }
+
+  /** One runner's capabilities and last contact, scoped to its owner. */
+  async desktopRunnerById(input: {
+    organizationId: string
+    ownerMemberId: string
+    runnerId: string
+  }): Promise<{ capabilities: AutomationDesktopRunnerCapability[]; lastSeenAt: number } | null> {
+    const rows = await db.select({
+      capabilities: AutomationRunnerTable.capabilities,
+      lastSeenAt: AutomationRunnerTable.last_seen_at,
+    }).from(AutomationRunnerTable).where(and(
+      inArray(AutomationRunnerTable.id, automationRunnerComputerIds(input)),
+      eq(AutomationRunnerTable.organization_id, normalizeOrganizationId(input.organizationId)),
+      eq(AutomationRunnerTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+    )).orderBy(desc(sql`${AutomationRunnerTable.id} = ${automationRunnerRowId(input)}`)).limit(1)
+    const row = rows[0]
+    return row ? { capabilities: row.capabilities ?? [], lastSeenAt: row.lastSeenAt.getTime() } : null
+  }
+
+  private async missedDesktopReason(input: {
+    organizationId: string
+    ownerMemberId: string
+    pinnedWorkspace: boolean
+    now: number
+  }): Promise<string> {
+    // The run being expired is still queued, so a running row is always a
+    // different occupied occurrence.
+    const busy = await db.select({ id: AutomationRunTable.id })
+      .from(AutomationRunTable)
+      .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+      .where(and(
+        eq(AutomationTable.organization_id, normalizeOrganizationId(input.organizationId)),
+        eq(AutomationTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+        eq(AutomationRunTable.execution_target, "desktop"),
+        eq(AutomationRunTable.status, "running"),
+      )).limit(1)
+    const lastSeenAt = await this.desktopRunnerLastSeenAt(input)
+    // Desktops leave a run pinned to a workspace they lack for the desktop
+    // that has it, so a connected, idle desktop means none of them has it.
+    if (!busy[0] && input.pinnedWorkspace && desktopRunnerConnected({ lastSeenAt, now: input.now })) {
+      return pinnedWorkspaceMissedMessage
+    }
+    return missedDesktopRunMessage({
+      busy: Boolean(busy[0]),
+      lastSeenAt,
+      now: input.now,
+    })
+  }
+
   async expireUnclaimedDesktop(input: { now: number; limit: number }): Promise<string[]> {
-    const rows = await db.select().from(AutomationRunTable).where(and(
-      eq(AutomationRunTable.status, "queued"),
-      eq(AutomationRunTable.execution_target, "desktop"),
-      lte(AutomationRunTable.claim_deadline_at, new Date(input.now)),
-    )).orderBy(asc(AutomationRunTable.claim_deadline_at)).limit(input.limit)
+    const rows = await db.select({
+      run: AutomationRunTable,
+      automation: AutomationTable,
+      revisionTarget: AutomationRevisionTable.execution_target,
+      workspaceId: AutomationRevisionTable.workspace_id,
+    })
+      .from(AutomationRunTable)
+      .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+      .innerJoin(AutomationRevisionTable, eq(AutomationRevisionTable.id, AutomationRunTable.revision_id))
+      .where(and(
+        eq(AutomationRunTable.status, "queued"),
+        eq(AutomationRunTable.execution_target, "desktop"),
+        lte(AutomationRunTable.claim_deadline_at, new Date(input.now)),
+      )).orderBy(asc(AutomationRunTable.claim_deadline_at)).limit(input.limit)
     const expired: string[] = []
-    for (const run of rows) {
+    for (const { run, automation, revisionTarget, workspaceId } of rows) {
+      const attempted = run.attempt_count > 0 || run.started_at !== null
+      const status = attempted ? "failed" : "skipped"
+      const code = attempted ? "lease_lost" : "runner_unavailable"
+      const message = attempted ? interruptedDesktopRunMessage : await this.missedDesktopReason({
+        organizationId: automation.organization_id,
+        ownerMemberId: automation.owner_member_id,
+        pinnedWorkspace: runWorkspaceId({ executionTarget: revisionTarget, workspaceId }, "desktop") !== null,
+        now: input.now,
+      })
       await db.update(AutomationRunTable).set({
-        status: "skipped",
+        status,
         error: {
-          code: "runner_unavailable",
-          message: "Missed — desktop runner unavailable.",
+          code,
+          message,
           retryable: false,
         },
-        result_summary: "Missed — desktop runner unavailable.",
+        result_summary: message,
         finished_at: new Date(input.now),
         updated_at: new Date(input.now),
-      }).where(and(eq(AutomationRunTable.id, run.id), eq(AutomationRunTable.status, "queued")))
+      }).where(and(
+        eq(AutomationRunTable.id, run.id),
+        eq(AutomationRunTable.status, "queued"),
+        eq(AutomationRunTable.attempt_count, run.attempt_count),
+        lte(AutomationRunTable.claim_deadline_at, new Date(input.now)),
+      ))
       const confirmed = await db.select({ status: AutomationRunTable.status, error: AutomationRunTable.error })
         .from(AutomationRunTable).where(eq(AutomationRunTable.id, run.id)).limit(1)
-      if (confirmed[0]?.status === "skipped" && confirmed[0].error?.code === "runner_unavailable") {
+      if (confirmed[0]?.status === status && confirmed[0].error?.code === code) {
         expired.push(run.id)
       }
     }
@@ -1148,6 +1584,42 @@ export class DenAutomationRepository implements AutomationRepository {
       .orderBy(desc(AutomationRunTable.id)).limit(limit + 1)
     const selected = rows.slice(0, limit)
     return { items: selected.map(mapRun), nextCursor: rows.length > limit ? selected.at(-1)?.id ?? null : null }
+  }
+
+  /**
+   * Runs of the owner's Automations whose calendar position (scheduledFor,
+   * else startedAt, else createdAt) falls in [from, to), oldest first, one
+   * page at a time. Scans created_at with a one-day pad on each side so
+   * recovery runs created after their slot are still found; the cursor is the
+   * last scanned run id (run ids sort by creation).
+   */
+  async listRunsInRange(input: { organizationId: string; ownerMemberId: string; from: number; to: number; cursor?: string; limit: number }): Promise<{
+    items: AutomationRun[]
+    nextCursor: string | null
+  }> {
+    const pad = 24 * 60 * 60 * 1_000
+    const limit = Math.max(1, Math.min(input.limit, AUTOMATION_RUN_RANGE_MAX_ITEMS))
+    const conditions = [
+      eq(AutomationTable.organization_id, normalizeOrganizationId(input.organizationId)),
+      eq(AutomationTable.owner_member_id, normalizeMemberId(input.ownerMemberId)),
+      gte(AutomationRunTable.created_at, new Date(input.from - pad)),
+      lt(AutomationRunTable.created_at, new Date(input.to + pad)),
+    ]
+    if (input.cursor) conditions.push(gt(AutomationRunTable.id, normalizeRunId(input.cursor)))
+    const rows = await db.select({ run: AutomationRunTable })
+      .from(AutomationRunTable)
+      .innerJoin(AutomationTable, eq(AutomationTable.id, AutomationRunTable.automation_id))
+      .where(and(...conditions))
+      .orderBy(asc(AutomationRunTable.id))
+      .limit(limit + 1)
+    const scanned = rows.slice(0, limit).map((row) => mapRun(row.run))
+    return {
+      items: scanned.filter((run) => {
+        const at = run.scheduledFor ?? run.startedAt ?? run.createdAt
+        return at >= input.from && at < input.to
+      }),
+      nextCursor: rows.length > limit ? scanned.at(-1)?.id ?? null : null,
+    }
   }
 
   async reclaimQueued(input: { runId: string; leaseOwner: string; leaseMs: number; now: number }): Promise<{

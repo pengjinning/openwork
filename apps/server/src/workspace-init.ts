@@ -32,6 +32,12 @@ function normalizePreset(preset: string | null | undefined): string {
   return trimmed;
 }
 
+function errorStringField(error: unknown, field: "code" | "path" | "syscall"): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const value = Object.getOwnPropertyDescriptor(error, field)?.value;
+  return typeof value === "string" ? value : undefined;
+}
+
 /**
  * Build the default per-workspace openwork config metadata. The openwork
  * config is now stored in the runtime DB (see
@@ -65,7 +71,16 @@ export async function ensureWorkspaceFiles(workspaceRoot: string, presetInput: s
   if (!workspaceRoot.trim()) {
     throw new ApiError(400, "invalid_workspace_path", "workspace path is required");
   }
-  await ensureDir(workspaceRoot);
+  try {
+    await ensureDir(workspaceRoot);
+  } catch (error) {
+    throw new ApiError(409, "workspace_inaccessible", "Workspace path is not accessible", {
+      path: workspaceRoot,
+      fsCode: errorStringField(error, "code"),
+      syscall: errorStringField(error, "syscall"),
+      fsPath: errorStringField(error, "path"),
+    });
+  }
   const reloadReasons = new Set<ReloadReason>();
   if (await ensureOpencodeConfig(workspaceRoot)) reloadReasons.add("config");
   // openwork config is seeded into the runtime DB by the caller, not written
@@ -80,19 +95,23 @@ export async function ensureWorkspaceFiles(workspaceRoot: string, presetInput: s
 /**
  * Provision workspace files for every workspace that has local files to set up.
  *
- * Skips remote workspaces (which live on a host and may even carry a non-empty
- * remote `directory`) and any workspace without a resolved local path. Either
- * would otherwise reach ensureWorkspaceFiles() — which throws
+ * Skips any workspace without a resolved local path, which would otherwise
+ * reach ensureWorkspaceFiles() — which throws
  * `invalid_workspace_path` on a blank path — and abort server startup. Local
- * workspaces are always created with a validated path, so they are unaffected.
- * Shared by the embedded-server and CLI boot paths.
+ * provisioning failures are logged and skipped so one stale path cannot abort
+ * startup. Shared by the embedded-server and CLI boot paths.
  */
 export async function ensureLocalWorkspaceFiles(
-  workspaces: ReadonlyArray<Pick<WorkspaceInfo, "path" | "preset" | "workspaceType">>,
+  workspaces: ReadonlyArray<Pick<WorkspaceInfo, "path" | "preset">>,
 ): Promise<void> {
   for (const workspace of workspaces) {
-    if (workspace.workspaceType === "remote" || !workspace.path.trim()) continue;
-    await ensureWorkspaceFiles(workspace.path, workspace.preset);
+    if (!workspace.path.trim()) continue;
+    try {
+      await ensureWorkspaceFiles(workspace.path, workspace.preset);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`Failed to provision workspace files at ${workspace.path}: ${message}`);
+    }
   }
 }
 

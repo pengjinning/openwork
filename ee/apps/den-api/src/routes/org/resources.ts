@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull } from "@openwork-ee/den-db/drizzle"
+import { and, desc, eq, inArray, isNull, sql } from "@openwork-ee/den-db/drizzle"
 import {
   ConfigObjectTable,
   LlmProviderAccessTable,
@@ -14,7 +14,7 @@ import { describeRoute } from "hono-openapi"
 import { z } from "zod"
 import { db } from "../../db.js"
 import { env } from "../../env.js"
-import { memberFacingMcpConnectionsEnabled } from "../../capability-sources/external-mcp-rollout.js"
+import { organizationAllowsManagedModels } from "../../inference.js"
 import { listAccessibleMarketplaceCapabilityReferences } from "../../mcp/marketplace-capabilities.js"
 import {
   type MemberTeamsContext,
@@ -109,6 +109,7 @@ async function listAccessibleLlmProviders(input: {
     return {}
   }
 
+  const managedModelsAllowed = await organizationAllowsManagedModels(input.organizationId)
   const rows = await db
     .select({
       id: LlmProviderTable.id,
@@ -118,6 +119,7 @@ async function listAccessibleLlmProviders(input: {
     .where(and(
       eq(LlmProviderTable.organizationId, input.organizationId),
       inArray(LlmProviderTable.id, providerIds),
+      managedModelsAllowed ? undefined : sql`${LlmProviderTable.source} <> 'openwork'`,
     ))
     .orderBy(desc(LlmProviderTable.updatedAt), desc(LlmProviderTable.id))
 
@@ -278,11 +280,14 @@ export function registerOrgResourceRoutes<T extends { Variables: OrgRouteVariabl
           orgMembershipId: organizationContext.currentMember.id,
           teamIds,
         },
-        enabled: memberFacingMcpConnectionsEnabled(organizationContext.organization.metadata, {
-          gatingEnabled: env.mcpConnectionsGatingEnabled,
-        }),
       })
-      return c.json({ items })
+      return c.json({
+        items: items.map((item) => ({
+          ...item,
+          // Published desktops only recognize the legacy wire value.
+          objectType: item.objectType === "workflow" ? "script" : item.objectType,
+        })),
+      })
     },
   )
 

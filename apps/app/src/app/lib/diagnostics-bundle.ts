@@ -1,4 +1,5 @@
 import { readDevLogs, type DevLogRecord } from "./dev-log";
+import { connectionDiagnosticHistory } from "./connection-diagnostic-history";
 import {
   appBuildInfo,
   engineInfo,
@@ -102,18 +103,14 @@ function pickHostInfo(info: OpenworkServerInfo | null) {
   if (!info) return null;
   return {
     running: Boolean(info.running),
-    remoteAccessEnabled: info.remoteAccessEnabled,
     baseUrl: info.baseUrl ?? null,
-    connectUrl: info.connectUrl ?? null,
-    mdnsUrl: info.mdnsUrl ?? null,
-    lanUrl: info.lanUrl ?? null,
     lastStdout: info.lastStdout ?? null,
     lastStderr: info.lastStderr ?? null,
   };
 }
 
 function defaultHostConnectUrl(hostInfo: OpenworkServerInfo | null) {
-  return hostInfo?.connectUrl ?? hostInfo?.mdnsUrl ?? hostInfo?.lanUrl ?? hostInfo?.baseUrl ?? "";
+  return hostInfo?.baseUrl ?? "";
 }
 
 function addSecretValue(secrets: string[], value: string | null | undefined) {
@@ -150,6 +147,7 @@ export function composeDiagnosticsBundleJson(input: DiagnosticsBundleInputs): st
   const clientConnected = context?.clientConnected === true;
   const bundle = {
     capturedAt: input.capturedAt,
+    connectionHistory: connectionDiagnosticHistory.read(),
     app: pickAppInfo(input.appInfo),
     opencodeEngine: pickEngineInfo(input.engineInfo),
     runtime: {

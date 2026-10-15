@@ -1,61 +1,32 @@
 "use client";
 
 import { createContext, createElement, useContext, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { usePathname, useRouter } from "next/navigation";
+import { SETUP_CONTINUATION_KEY, parseSetupContinuation, type SetupContinuation } from "../_lib/setup-continuation";
 import {
   AUTH_TOKEN_STORAGE_KEY,
   DEFAULT_AUTH_NAME,
-  DEFAULT_WORKER_NAME,
-  LAST_WORKER_STORAGE_KEY,
-  ONBOARDING_INTENT_STORAGE_KEY,
   PENDING_SOCIAL_SIGNUP_STORAGE_KEY,
-  WORKER_STATUS_POLL_MS,
-  type AuthMethod,
   type AuthMode,
   type AuthUser,
-  type BillingSummary,
-  type LaunchEvent,
-  type OnboardingIntent,
-  type OrgLimitError,
-  type RuntimeServiceName,
   type SocialAuthProvider,
-  type WorkerLaunch,
-  type WorkerListItem,
-  type WorkerRuntimeSnapshot,
-  type WorkerSummary,
-  type WorkerStatusBucket,
-  buildOpenworkAppConnectUrl,
-  buildOpenworkDeepLink,
-  deriveOnboardingWorkerName,
   getAuthInfoForMode,
-  getBillingSummary,
   getEmailDomain,
   getErrorMessage,
-  getOrgLimitError,
-  getRuntimeServiceLabel,
   getSocialCallbackUrl,
   getSocialProviderLabel,
   getToken,
   getUser,
-  getWorker,
-  getWorkerRuntimeSnapshot,
-  getWorkerStatusCopy,
-  getWorkerStatusMeta,
-  getWorkerSummary,
-  getWorkerTokens,
-  getWorkersList,
   identifyPosthogUser,
-  isWorkerLaunch,
-  listItemToWorker,
   normalizeAuthIntentParam,
   normalizeAuthModeParam,
   PENDING_AUTH_INTENT_STORAGE_KEY,
-  parseWorkspaceIdFromUrl,
   requestJson,
   resetPosthogUser,
-  resolveOpenworkWorkspaceUrl,
   trackPosthogEvent
 } from "../_lib/den-flow";
-import { EMPTY_RUNTIME_CONFIG, getRuntimeConfig, type DenWebRuntimeConfig } from "../_lib/runtime-config";
+import { EMPTY_RUNTIME_CONFIG, getRuntimeConfig, resetRuntimeConfig, type DenWebRuntimeConfig } from "../_lib/runtime-config";
+import { resolveMemberReturnTo, type MemberAuthCheckStatus } from "../_lib/member-auth-routing";
 import {
   getDesktopHandoffGrant,
   getDesktopHandoffOpenworkUrl,
@@ -63,17 +34,15 @@ import {
 } from "../_lib/desktop-handoff";
 import {
   PENDING_ORG_INVITATION_STORAGE_KEY,
-  PENDING_ORG_SELECTION_STORAGE_KEY,
   PENDING_WORKSPACE_CLAIM_STORAGE_KEY,
   getInferenceRoute,
   getJoinOrgRoute,
   getOrgDashboardRoute,
   getWorkspaceClaimRoute,
   parseOrgListPayload,
-  shouldOfferOrgSelection,
 } from "../_lib/den-org";
+import { requestOrgSelectionOnNextLoad } from "../_lib/org-selection";
 
-type LaunchWorkerResult = "success" | "limit" | "error";
 type AuthNavigationResult = "dashboard" | "join-org" | null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -123,11 +92,19 @@ type DenFlowContextValue = {
   signupPasswordFeedback: string[];
   user: AuthUser | null;
   sessionHydrated: boolean;
+  memberAuthCheckStatus: MemberAuthCheckStatus;
+  memberAuthCheckError: string | null;
+  retryMemberAuthCheck: () => void;
   desktopAuthRequested: boolean;
   desktopAuthScheme: string;
+  setupPending: boolean;
+  setupOrganizationId: string | null;
+  continueSetup: (organizationId: string | null, route: string) => void;
+  completeSetup: (organizationId: string) => Promise<boolean>;
   webAuthRequested: boolean;
   desktopRedirectUrl: string | null;
   desktopRedirectBusy: boolean;
+  retryDesktopAuthHandoff: () => void;
   showAuthFeedback: boolean;
   submitAuth: (event: FormEvent<HTMLFormElement>) => Promise<AuthNavigationResult>;
   submitVerificationCode: (event: FormEvent<HTMLFormElement>) => Promise<AuthNavigationResult>;
@@ -135,63 +112,12 @@ type DenFlowContextValue = {
   cancelVerification: () => void;
   beginSocialAuth: (provider: SocialAuthProvider) => Promise<void>;
   signOut: () => Promise<void>;
+  /** Re-checks the session with Den; clears the signed-in user when it is gone. */
+  revalidateSession: () => Promise<AuthUser | null>;
   updateUserProfile: (input: { firstName: string; lastName: string }) => Promise<AuthUser>;
   resolveUserLandingRoute: () => Promise<string | null>;
-  billingSummary: BillingSummary | null;
-  billingBusy: boolean;
-  billingError: string | null;
-  orgLimitError: OrgLimitError | null;
-  clearOrgLimitError: () => void;
-  refreshBilling: (options?: { quiet?: boolean }) => Promise<BillingSummary | null>;
-  onboardingPending: boolean;
-  onboardingDecisionBusy: boolean;
-  workers: WorkerListItem[];
-  filteredWorkers: WorkerListItem[];
-  workersBusy: boolean;
-  workersLoadedOnce: boolean;
-  workersError: string | null;
-  workerQuery: string;
-  setWorkerQuery: (value: string) => void;
-  workerStatusFilter: WorkerStatusBucket | "all";
-  setWorkerStatusFilter: (value: WorkerStatusBucket | "all") => void;
-  selectedWorker: WorkerListItem | null;
-  activeWorker: WorkerLaunch | null;
-  selectWorker: (item: WorkerListItem) => void;
-  workerName: string;
-  setWorkerName: (value: string) => void;
-  launchBusy: boolean;
-  launchStatus: string;
-  launchError: string | null;
-  actionBusy: "status" | "token" | null;
-  deleteBusyWorkerId: string | null;
-  redeployBusyWorkerId: string | null;
-  renameBusyWorkerId: string | null;
-  runtimeSnapshot: WorkerRuntimeSnapshot | null;
-  runtimeBusy: boolean;
-  runtimeError: string | null;
-  runtimeUpgradeBusy: boolean;
-  copiedField: string | null;
-  events: LaunchEvent[];
   runtimeConfig: DenWebRuntimeConfig;
   runtimeConfigLoaded: boolean;
-  openworkDeepLink: string | null;
-  openworkAppConnectUrl: string | null;
-  hasWorkspaceScopedUrl: boolean;
-  additionalWorkerNeedsPlan: boolean;
-  selectedStatusMeta: { label: string; bucket: WorkerStatusBucket };
-  isSelectedWorkerFailed: boolean;
-  ownedWorkerCount: number;
-  refreshWorkers: (options?: { keepSelection?: boolean; quiet?: boolean }) => Promise<void>;
-  launchWorker: (options?: { source?: "manual" | "signup_auto"; workerNameOverride?: string }) => Promise<LaunchWorkerResult>;
-  checkWorkerStatus: (options?: { workerId?: string; quiet?: boolean; background?: boolean }) => Promise<void>;
-  generateWorkerToken: () => Promise<void>;
-  renameWorker: (workerId: string, name: string) => Promise<boolean>;
-  deleteWorker: (workerId: string) => Promise<void>;
-  redeployWorker: (workerId: string) => Promise<void>;
-  refreshRuntime: (workerId?: string, options?: { quiet?: boolean }) => Promise<WorkerRuntimeSnapshot | null>;
-  upgradeRuntime: () => Promise<void>;
-  copyToClipboard: (field: string, value: string | null) => Promise<void>;
-  getRuntimeServiceLabel: (name: RuntimeServiceName) => string;
 };
 
 const DenFlowContext = createContext<DenFlowContextValue | null>(null);
@@ -228,6 +154,12 @@ function clearPendingAuthIntent() {
 }
 
 export function DenFlowProvider({ children }: { children: ReactNode }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const [continuation, setContinuation] = useState<SetupContinuation | null>(null);
+  const continuationRef = useRef<SetupContinuation | null>(null);
+  const handoffBusyRef = useRef(false);
+  const sessionEpochRef = useRef(0);
   const [authMode, setAuthModeState] = useState<AuthMode>("sign-up");
   const [email, setEmail] = useState("");
   const [authName, setAuthName] = useState("");
@@ -251,152 +183,39 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     return token;
   });
-  const [sessionHydrated, setSessionHydrated] = useState(false);
-  const [desktopAuthRequested, setDesktopAuthRequested] = useState(false);
-  const [desktopAuthScheme, setDesktopAuthScheme] = useState("openwork");
+  const [hydratedSession, setHydratedSession] = useState<{ token: string | null } | null>(null);
+  const sessionHydrated = hydratedSession !== null && hydratedSession.token === authToken;
+  const [memberAuthCheckStatus, setMemberAuthCheckStatus] = useState<MemberAuthCheckStatus>("checking");
+  const [memberAuthCheckError, setMemberAuthCheckError] = useState<string | null>(null);
+  const [memberAuthCheckAttempt, setMemberAuthCheckAttempt] = useState(0);
+  const desktopAuthScheme = continuation?.desktopScheme ?? "openwork";
+  const setupPending = Boolean(user && continuation?.userId === user.id && continuation.setup);
   const [webAuthRequested, setWebAuthRequested] = useState(false);
   const [webAuthReturnUrl, setWebAuthReturnUrl] = useState<string | null>(null);
   const [desktopRedirectBusy, setDesktopRedirectBusy] = useState(false);
   const [desktopRedirectUrl, setDesktopRedirectUrl] = useState<string | null>(null);
+  const desktopAuthRequested = Boolean(continuation?.desktopScheme || desktopRedirectUrl);
   const [desktopRedirectAttempted, setDesktopRedirectAttempted] = useState(false);
   const [webRedirectBusy, setWebRedirectBusy] = useState(false);
   const [webRedirectAttempted, setWebRedirectAttempted] = useState(false);
-  const [billingSummary, setBillingSummary] = useState<BillingSummary | null>(null);
-  const [billingBusy, setBillingBusy] = useState(false);
-  const [billingError, setBillingError] = useState<string | null>(null);
-  const [billingLoadedOnce, setBillingLoadedOnce] = useState(false);
-  const [orgLimitError, setOrgLimitError] = useState<OrgLimitError | null>(null);
-
-  const [workerName, setWorkerName] = useState(DEFAULT_WORKER_NAME);
-  const [worker, setWorker] = useState<WorkerLaunch | null>(null);
-  const [workerLookupId, setWorkerLookupId] = useState("");
-  const [workers, setWorkers] = useState<WorkerListItem[]>([]);
-  const [workersBusy, setWorkersBusy] = useState(false);
-  const [workersLoadedOnce, setWorkersLoadedOnce] = useState(false);
-  const [workersError, setWorkersError] = useState<string | null>(null);
-  const [workerQuery, setWorkerQuery] = useState("");
-  const [workerStatusFilter, setWorkerStatusFilter] = useState<WorkerStatusBucket | "all">("all");
-  const [launchBusy, setLaunchBusy] = useState(false);
-  const [actionBusy, setActionBusy] = useState<"status" | "token" | null>(null);
-  const [launchStatus, setLaunchStatus] = useState("Choose a worker name and launch.");
-  const [launchError, setLaunchError] = useState<string | null>(null);
-  const [events, setEvents] = useState<LaunchEvent[]>([]);
-  const [copiedField, setCopiedField] = useState<string | null>(null);
-  const [tokenFetchedForWorkerId, setTokenFetchedForWorkerId] = useState<string | null>(null);
-  const [deleteBusyWorkerId, setDeleteBusyWorkerId] = useState<string | null>(null);
-  const [redeployBusyWorkerId, setRedeployBusyWorkerId] = useState<string | null>(null);
-  const [renameBusyWorkerId, setRenameBusyWorkerId] = useState<string | null>(null);
-  const [pendingRestoredWorkerId, setPendingRestoredWorkerId] = useState<string | null>(null);
-  const [runtimeSnapshot, setRuntimeSnapshot] = useState<WorkerRuntimeSnapshot | null>(null);
-  const [runtimeBusy, setRuntimeBusy] = useState(false);
-  const [runtimeError, setRuntimeError] = useState<string | null>(null);
-  const [runtimeUpgradeBusy, setRuntimeUpgradeBusy] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<DenWebRuntimeConfig>(EMPTY_RUNTIME_CONFIG);
   const [runtimeConfigLoaded, setRuntimeConfigLoaded] = useState(false);
   const isSingleOrgMode = runtimeConfigLoaded && runtimeConfig.orgMode === "single_org";
 
-  const [onboardingIntent, setOnboardingIntent] = useState<OnboardingIntent | null>(null);
-  const onboardingAutoLaunchKeyRef = useRef<string | null>(null);
   const socialSignupHandledRef = useRef<string | null>(null);
-  const pendingWorkersRequestRef = useRef<Promise<{ response: Response; payload: unknown }> | null>(null);
 
-  const selectedWorker = workers.find((item) => item.workerId === workerLookupId) ?? null;
-  const activeWorker =
-    worker && workerLookupId === worker.workerId
-      ? worker
-      : selectedWorker
-        ? listItemToWorker(selectedWorker, worker)
-        : worker;
-  const openworkConnectUrl = activeWorker?.openworkUrl ?? activeWorker?.instanceUrl ?? null;
-  const preferredOpenworkToken = activeWorker?.clientToken ?? activeWorker?.ownerToken ?? null;
-  const hasWorkspaceScopedUrl = Boolean(openworkConnectUrl && /\/w\/[^/?#]+/.test(openworkConnectUrl));
-  const openworkDeepLink = buildOpenworkDeepLink(
-    openworkConnectUrl,
-    preferredOpenworkToken,
-    activeWorker?.workerId ?? null,
-    activeWorker?.workerName ?? null
-  );
-  const openworkAppConnectUrl = buildOpenworkAppConnectUrl(
-    runtimeConfig.openworkAppConnectUrl,
-    openworkConnectUrl,
-    preferredOpenworkToken,
-    activeWorker?.workerId ?? null,
-    activeWorker?.workerName ?? null,
-    { autoConnect: true }
-  );
-  const ownedWorkerCount = workers.filter((item) => item.isMine).length;
-  const additionalWorkerNeedsPlan = Boolean(
-    user &&
-      ownedWorkerCount > 0 &&
-      billingSummary?.featureGateEnabled &&
-      !billingSummary.hasActivePlan
-  );
-  const selectedWorkerStatus = activeWorker?.status ?? selectedWorker?.status ?? "unknown";
-  const selectedStatusMeta = getWorkerStatusMeta(selectedWorkerStatus);
-  const isSelectedWorkerFailed = selectedWorkerStatus.trim().toLowerCase() === "failed";
-  const onboardingPending = Boolean(onboardingIntent?.shouldLaunch && !onboardingIntent.completed);
-  const onboardingDecisionBusy = onboardingPending && !billingLoadedOnce && (billingBusy || !sessionHydrated);
-
-  const filteredWorkers = workers.filter((item) => {
-    const query = workerQuery.trim().toLowerCase();
-    const matchesQuery =
-      !query ||
-      item.workerName.toLowerCase().includes(query) ||
-      item.workerId.toLowerCase().includes(query);
-
-    if (!matchesQuery) {
-      return false;
-    }
-
-    if (workerStatusFilter === "all") {
-      return true;
-    }
-
-    return getWorkerStatusMeta(item.status).bucket === workerStatusFilter;
-  });
-
-  function persistOnboardingIntent(next: OnboardingIntent | null) {
-    setOnboardingIntent(next);
-
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    if (!next) {
-      window.localStorage.removeItem(ONBOARDING_INTENT_STORAGE_KEY);
-      return;
-    }
-
-    window.localStorage.setItem(ONBOARDING_INTENT_STORAGE_KEY, JSON.stringify(next));
+  function persistContinuation(next: SetupContinuation | null) {
+    continuationRef.current = next;
+    setContinuation(next);
+    if (next) window.sessionStorage.setItem(SETUP_CONTINUATION_KEY, JSON.stringify(next));
+    else window.sessionStorage.removeItem(SETUP_CONTINUATION_KEY);
   }
 
-  function appendEvent(level: LaunchEvent["level"], label: string, detail: string) {
-    setEvents((current) => {
-      const next: LaunchEvent[] = [
-        {
-          id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-          level,
-          label,
-          detail,
-          at: new Date().toISOString()
-        },
-        ...current
-      ];
-
-      return next.slice(0, 10);
-    });
-  }
-
-  function markOnboardingComplete() {
-    if (!onboardingIntent || onboardingIntent.completed) {
-      return;
-    }
-
-    persistOnboardingIntent({
-      ...onboardingIntent,
-      completed: true,
-      shouldLaunch: false
-    });
+  function continueSetup(organizationId: string | null, route: string) {
+    if (!runtimeConfigLoaded || !sessionHydrated || !user || isSingleOrgMode) return;
+    const current = continuationRef.current;
+    persistContinuation({ userId: user.id, desktopScheme: current?.userId === user.id ? current.desktopScheme : null,
+      setup: { organizationId, route }, at: Date.now() });
   }
 
   function setAuthMode(mode: AuthMode) {
@@ -430,7 +249,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
   }
 
   async function redirectToRequiredSso(trimmedEmail: string) {
-    const { response, payload } = await requestJson(`/v1/orgs/sso/resolve?email=${encodeURIComponent(trimmedEmail)}`, { method: "GET" }, 12000);
+    const { response, payload } = await requestJson(`/api/auth/sso-resolve?email=${encodeURIComponent(trimmedEmail)}`, { method: "GET" }, 12000);
 
     if (!response.ok) {
       throw new Error(getErrorMessage(payload, response.status === 403 ? "We could not verify this sign-in attempt. Please refresh and try again." : `Could not resolve workspace SSO (${response.status}).`));
@@ -464,7 +283,12 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
   ): Promise<AuthNavigationResult> {
     let payload = payloadOverride;
 
-    if (payload === undefined || (!getToken(payload) && nextMode === "sign-up" && Boolean(password))) {
+    // Verifying an email proves the mailbox but does not sign anyone in:
+    // /email-otp/verify-email answers with `token: null` and sets no cookie.
+    // Exchange the password the person just typed for a session in sign-in
+    // as well as sign-up, or an existing account that verifies from the
+    // sign-in form is shown as signed in without a session (ENG-550).
+    if (payload === undefined || (!getToken(payload) && Boolean(password))) {
       const signInBody = {
         email: trimmedEmail,
         password,
@@ -494,17 +318,24 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     }
 
     let authenticatedUser: AuthUser | null = null;
-    const payloadUser = getUser(payload);
+    // A user object alone is not a session: the verify-email reply carries one
+    // with `token: null`. Trust it only next to a token; otherwise ask Den.
+    const payloadUser = token ? getUser(payload) : null;
     if (payloadUser) {
       authenticatedUser = payloadUser;
       setUser(payloadUser);
       setAuthInfo(`Signed in as ${payloadUser.email}.`);
-      appendEvent("success", nextMode === "sign-up" ? "Account created" : "Signed in", payloadUser.email);
     } else {
       const refreshed = await refreshSession(true);
       if (refreshed) {
         authenticatedUser = refreshed;
-        appendEvent("success", nextMode === "sign-up" ? "Account created" : "Signed in", refreshed.email);
+      } else if (getUser(payload)) {
+        // Verified, but there is no password to exchange for a session. Keep
+        // the person on the sign-in step instead of a signed-in screen that
+        // every request would reject.
+        setAuthMode("sign-in");
+        setAuthInfo(`Email verified. Sign in as ${trimmedEmail} to continue.`);
+        return null;
       } else {
         setAuthInfo("Authentication succeeded, but session details are still syncing.");
       }
@@ -525,22 +356,13 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       }
     }
 
-    if (desktopAuthRequested) {
-      setAuthInfo("Signed in. Returning to OpenWork...");
-      return null;
-    }
-
-    if (webAuthRequested) {
-      setAuthInfo("Signed in. Returning to OpenWork...");
-      return null;
-    }
-
     if (authenticatedUser && (getPendingWorkspaceClaimToken() || getPendingOrgInvitationId())) {
       return "join-org";
     }
 
-    if (authenticatedUser && nextMode === "sign-up") {
-      return await beginSignupOnboarding(authenticatedUser, "email");
+    if (desktopAuthRequested || webAuthRequested) {
+      setAuthInfo("Signed in. Returning to OpenWork...");
+      return null;
     }
 
     return "dashboard" as const;
@@ -575,7 +397,6 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       }
 
       setAuthInfo(`We sent a fresh verification code to ${trimmedEmail}.`);
-      appendEvent("info", "Verification code resent", trimmedEmail);
       trackPosthogEvent("den_signup_verification_sent", {
         method: "email",
         email_domain: getEmailDomain(trimmedEmail),
@@ -627,7 +448,6 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       setVerificationRequired(false);
       setVerificationCode("");
       setAuthInfo(`Email verified for ${trimmedEmail}. Finishing sign-in...`);
-      appendEvent("success", "Email verified", trimmedEmail);
       trackPosthogEvent("den_email_verified", {
         method: "email",
         email_domain: getEmailDomain(trimmedEmail),
@@ -642,361 +462,33 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function withResolvedOpenworkCredentials(candidate: WorkerLaunch, options: { quiet?: boolean } = {}) {
-    const existingConnectUrl = candidate.openworkUrl?.trim() ?? "";
-    const existingWorkspaceId = candidate.workspaceId?.trim() ?? "";
-    if (existingConnectUrl && existingWorkspaceId) {
-      return {
-        ...candidate,
-        openworkUrl: existingConnectUrl,
-        workspaceId: existingWorkspaceId
-      };
-    }
-
-    const instanceUrl = candidate.instanceUrl?.trim() ?? "";
-    if (!instanceUrl) {
-      return {
-        ...candidate,
-        openworkUrl: null,
-        workspaceId: null
-      };
-    }
-
-    const accessToken = candidate.clientToken?.trim() ?? candidate.ownerToken?.trim() ?? "";
-    if (!accessToken) {
-      const mountedWorkspaceId = parseWorkspaceIdFromUrl(instanceUrl);
-      return {
-        ...candidate,
-        openworkUrl: instanceUrl.trim().replace(/\/+$/, ""),
-        workspaceId: mountedWorkspaceId
-      };
-    }
-
-    try {
-      const resolved = await resolveOpenworkWorkspaceUrl(instanceUrl, accessToken);
-      if (resolved) {
-        return {
-          ...candidate,
-          openworkUrl: resolved.openworkUrl,
-          workspaceId: resolved.workspaceId
-        };
-      }
-    } catch {
-      if (!options.quiet) {
-        appendEvent("warning", "Credential hint", "Could not resolve /w/ URL yet. Using host URL fallback.");
-      }
-    }
-
-    return {
-      ...candidate,
-      openworkUrl: instanceUrl.trim().replace(/\/+$/, ""),
-      workspaceId: parseWorkspaceIdFromUrl(instanceUrl)
-    };
-  }
-
-  async function refreshWorkers(options: { keepSelection?: boolean; quiet?: boolean } = {}) {
-    if (!user) {
-      setWorkers([]);
-      setWorkersLoadedOnce(false);
-      setWorkersError(null);
-      return;
-    }
-
-    if (!options.quiet) {
-      setWorkersBusy(true);
-      setWorkersError(null);
-    }
-
-    try {
-      if (!pendingWorkersRequestRef.current) {
-        pendingWorkersRequestRef.current = requestJson("/v1/workers?limit=20", {
-          method: "GET",
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
-        });
-      }
-
-      const { response, payload } = await pendingWorkersRequestRef.current;
-
-      if (!response.ok) {
-        if (!options.quiet) {
-          setWorkersError(getErrorMessage(payload, `Failed to load workers (${response.status}).`));
-        }
-        setWorkersLoadedOnce(true);
-        return;
-      }
-
-      const nextWorkers = getWorkersList(payload);
-      setWorkers(nextWorkers);
-      setWorkersLoadedOnce(true);
-
-      const restoredWorkerStillExists =
-        pendingRestoredWorkerId && nextWorkers.some((item) => item.workerId === pendingRestoredWorkerId);
-      const currentSelection = options.keepSelection ? workerLookupId : "";
-      const nextSelectedId =
-        currentSelection && nextWorkers.some((item) => item.workerId === currentSelection)
-          ? currentSelection
-          : nextWorkers[0]?.workerId ?? "";
-      const nextSelectedWorker = nextSelectedId
-        ? nextWorkers.find((item) => item.workerId === nextSelectedId) ?? null
-        : null;
-
-      setWorkerLookupId(nextSelectedId);
-
-      if (!nextSelectedId) {
-        setWorker(null);
-        setTokenFetchedForWorkerId(null);
-        setPendingRestoredWorkerId(null);
-        setLaunchStatus("Choose a worker name and launch.");
-        if (typeof window !== "undefined") {
-          window.localStorage.removeItem(LAST_WORKER_STORAGE_KEY);
-        }
-        return;
-      }
-
-      if (restoredWorkerStillExists) {
-        setPendingRestoredWorkerId(null);
-      }
-
-      if (nextSelectedWorker) {
-        setWorker((current) => listItemToWorker(nextSelectedWorker, current));
-        if (!launchBusy) {
-          setLaunchStatus(getWorkerStatusCopy(nextSelectedWorker.status));
-        }
-      }
-    } catch (error) {
-      if (!options.quiet) {
-        setWorkersError(error instanceof Error ? error.message : "Unknown network error");
-      }
-      setWorkersLoadedOnce(true);
-    } finally {
-      pendingWorkersRequestRef.current = null;
-      if (!options.quiet) {
-        setWorkersBusy(false);
-      }
-    }
-  }
-
-  function mergeWorkerSummaryIntoList(summary: WorkerSummary) {
-    setWorkers((current) => current.map((entry) =>
-      entry.workerId === summary.workerId
-        ? {
-            ...entry,
-            workerName: summary.workerName,
-            status: summary.status,
-            provider: summary.provider,
-            instanceUrl: summary.instanceUrl,
-            isMine: summary.isMine,
-          }
-        : entry,
-    ));
-  }
-
-  async function refreshRuntime(workerId?: string, options: { quiet?: boolean } = {}) {
-    const targetWorkerId = workerId ?? activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
-    if (!user || !targetWorkerId) {
-      setRuntimeSnapshot(null);
-      if (!options.quiet) {
-        setRuntimeError("Select a worker to inspect runtime versions.");
-      }
-      return null;
-    }
-
-    setRuntimeBusy(true);
-    if (!options.quiet) {
-      setRuntimeError(null);
-    }
-
-    try {
-      const { response, payload } = await requestJson(
-        `/v1/workers/${encodeURIComponent(targetWorkerId)}/runtime`,
-        {
-          method: "GET",
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
-        },
-        12000
-      );
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Runtime check failed with ${response.status}.`);
-        if (!options.quiet) {
-          setRuntimeError(message);
-        }
-        return null;
-      }
-
-      const snapshot = getWorkerRuntimeSnapshot(payload);
-      if (!snapshot) {
-        if (!options.quiet) {
-          setRuntimeError("Runtime details were missing from the worker response.");
-        }
-        return null;
-      }
-
-      setRuntimeSnapshot(snapshot);
-      return snapshot;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown network error";
-      if (!options.quiet) {
-        setRuntimeError(message);
-      }
-      return null;
-    } finally {
-      setRuntimeBusy(false);
-    }
-  }
-
-  async function upgradeRuntime() {
-    const targetWorkerId = activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
-    if (!user || !targetWorkerId || runtimeUpgradeBusy) {
-      return;
-    }
-
-    setRuntimeUpgradeBusy(true);
-    setRuntimeError(null);
-
-    try {
-      const { response, payload } = await requestJson(
-        `/v1/workers/${encodeURIComponent(targetWorkerId)}/runtime/upgrade`,
-        {
-          method: "POST",
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-          body: JSON.stringify({ services: ["openwork-server", "opencode"] })
-        },
-        12000
-      );
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Runtime upgrade failed with ${response.status}.`);
-        setRuntimeError(message);
-        appendEvent("error", "Runtime upgrade failed", message);
-        return;
-      }
-
-      appendEvent("info", "Runtime upgrade started", activeWorker?.workerName ?? selectedWorker?.workerName ?? targetWorkerId);
-      setRuntimeSnapshot((current) =>
-        current
-          ? {
-              ...current,
-              upgrade: {
-                ...current.upgrade,
-                status: "running",
-                startedAt: new Date().toISOString(),
-                finishedAt: null,
-                error: null
-              }
-            }
-          : current
-      );
-
-      window.setTimeout(() => {
-        void refreshRuntime(targetWorkerId, { quiet: true });
-      }, 4000);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown network error";
-      setRuntimeError(message);
-      appendEvent("error", "Runtime upgrade failed", message);
-    } finally {
-      setRuntimeUpgradeBusy(false);
-    }
-  }
-
-  async function refreshBilling(options: { quiet?: boolean } = {}) {
-    if (!user) {
-      setBillingSummary(null);
-      if (!options.quiet) {
-        setBillingError("Sign in to view billing details.");
-      }
-      return null;
-    }
-
-    const quiet = options.quiet === true;
-    setBillingBusy(true);
-
-    if (!quiet) {
-      setBillingError(null);
-    }
-
-    try {
-      const { response, payload } = await requestJson(
-        "/v1/billing",
-        {
-          method: "GET",
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
-        },
-        12000
-      );
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Billing lookup failed with ${response.status}.`);
-        if (!quiet) {
-          setBillingError(message);
-          appendEvent("error", "Billing check failed", message);
-        }
-        return null;
-      }
-
-      const summary = getBillingSummary(payload);
-      if (!summary) {
-        if (!quiet) {
-          setBillingError("Billing response was missing details.");
-          appendEvent("error", "Billing check failed", "Billing summary missing");
-        }
-        return null;
-      }
-
-      setBillingSummary(summary);
-      setBillingLoadedOnce(true);
-
-      return summary;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown network error";
-      if (!quiet) {
-        setBillingError(message);
-        appendEvent("error", "Billing check failed", message);
-      }
-      return null;
-    } finally {
-      setBillingBusy(false);
-    }
-  }
-
-  async function copyToClipboard(field: string, value: string | null) {
-    if (!value) {
-      return;
-    }
-
-    await navigator.clipboard.writeText(value);
-    setCopiedField(field);
-    setTimeout(() => {
-      setCopiedField((current) => (current === field ? null : current));
-    }, 1800);
-  }
-
-  async function refreshSession(quiet = false) {
+  async function refreshSession(quiet = false, isCurrent = () => true) {
+    const epoch = sessionEpochRef.current;
     const headers = new Headers();
     if (authToken) {
       headers.set("Authorization", `Bearer ${authToken}`);
     }
 
     const { response, payload } = await requestJson("/v1/me", { method: "GET", headers }, 12000);
+    if (!isCurrent() || epoch !== sessionEpochRef.current) return null;
 
     if (!response.ok) {
-      setUser(null);
-      if (response.status === 401 && authToken) {
-        setAuthToken(null);
+      if (response.status === 401) {
+        setUser(null);
+        if (authToken) {
+          setAuthToken(null);
+        }
+        if (!quiet) {
+          setAuthError("No active session found. Sign in first.");
+        }
+        return null;
       }
-      if (!quiet) {
-        setAuthError("No active session found. Sign in first.");
-      }
-      return null;
+      throw new Error(getErrorMessage(payload, `Could not check your sign-in status (${response.status}).`));
     }
 
     const sessionUser = getUser(payload);
     if (!sessionUser) {
-      if (!quiet) {
-        setAuthError("Session response did not include a user.");
-      }
-      return null;
+      throw new Error("Session response did not include a user.");
     }
 
     setUser(sessionUser);
@@ -1012,31 +504,23 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     const { response, payload } = await requestJson("/v1/me/orgs", { method: "GET", headers }, 12000);
     if (!response.ok) {
-      return {
-        orgs: [],
-        activeOrgId: null,
-        activeOrgSlug: null,
-      };
+      throw new Error(getErrorMessage(payload, "Could not load your organizations. Refresh to try again."));
     }
-
-    return parseOrgListPayload(payload);
+    if (!isRecord(payload) || !Array.isArray(payload.orgs)) throw new Error("Organization lookup returned incomplete details.");
+    const directory = parseOrgListPayload(payload);
+    if (directory.orgs.length !== payload.orgs.length) throw new Error("Organization lookup returned incomplete details.");
+    return directory;
   }
 
-  async function resolveDashboardRoute() {
-    const orgDirectory = await loadOrgDirectory();
-    if (typeof window !== "undefined" && shouldOfferOrgSelection(orgDirectory.orgs)) {
-      window.sessionStorage.setItem(PENDING_ORG_SELECTION_STORAGE_KEY, "1");
+  async function completeDesktopAuthHandoff(organizationId?: string) {
+    const current = continuationRef.current;
+    const epoch = sessionEpochRef.current;
+    if (!runtimeConfigLoaded || !sessionHydrated || authBusy || !current?.desktopScheme || current.userId !== user?.id || handoffBusyRef.current
+      || (current.setup && current.setup.organizationId !== organizationId)) {
+      return false;
     }
 
-    const activeOrgSlug = orgDirectory.activeOrgSlug ?? orgDirectory.orgs[0]?.slug ?? null;
-    return activeOrgSlug ? getOrgDashboardRoute(activeOrgSlug) : null;
-  }
-
-  async function completeDesktopAuthHandoff() {
-    if (!desktopAuthRequested || desktopRedirectBusy) {
-      return;
-    }
-
+    handoffBusyRef.current = true;
     setDesktopRedirectBusy(true);
     setDesktopRedirectAttempted(true);
     setAuthError(null);
@@ -1047,31 +531,60 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
         headers.set("Authorization", `Bearer ${authToken}`);
       }
 
-      const { response, payload } = await requestJson("/v1/auth/desktop-handoff", {
+      if (organizationId) {
+        const selected = await requestJson("/v1/me/active-organization", {
+          method: "POST", headers, body: JSON.stringify({ organizationId }),
+        });
+        if (!selected.response.ok) throw new Error(getErrorMessage(selected.payload, "Could not select your workspace."));
+      }
+      if (continuationRef.current !== current || epoch !== sessionEpochRef.current) return false;
+
+      const { response, payload } = await requestJson("/api/auth/desktop-handoff", {
         method: "POST",
         headers,
         body: JSON.stringify({ desktopScheme: desktopAuthScheme })
       });
+      if (continuationRef.current !== current || epoch !== sessionEpochRef.current) return false;
 
       if (!response.ok) {
         setAuthError(getErrorMessage(payload, `Desktop handoff failed with ${response.status}.`));
-        return;
+        return false;
       }
 
       const openworkUrl = getDesktopHandoffOpenworkUrl(payload) ?? "";
       if (!openworkUrl) {
         setAuthError("Desktop handoff succeeded, but no OpenWork redirect URL was returned.");
-        return;
+        return false;
       }
 
       rememberDesktopHandoffGrant(getDesktopHandoffGrant(payload, openworkUrl));
       setDesktopRedirectUrl(openworkUrl);
+      persistContinuation(null);
+      clearPendingAuthIntent();
       window.location.assign(openworkUrl);
+      return true;
     } catch (error) {
-      setAuthError(error instanceof Error ? error.message : "Failed to open OpenWork.");
+      if (continuationRef.current === current && epoch === sessionEpochRef.current) setAuthError(error instanceof Error ? error.message : "Failed to open OpenWork.");
+      return false;
     } finally {
+      handoffBusyRef.current = false;
       setDesktopRedirectBusy(false);
     }
+  }
+
+  async function completeSetup(organizationId: string) {
+    const current = continuationRef.current;
+    if (!runtimeConfigLoaded || !sessionHydrated) return false;
+    if (!user || (current && current.userId !== user.id)
+      || (current?.setup && current.setup.organizationId !== organizationId)) {
+      setAuthError("Return to the workspace where you started setup before completing it.");
+      return false;
+    }
+    if (getPendingOrgInvitationId() || getPendingWorkspaceClaimToken()) return false;
+    if (current?.desktopScheme) return completeDesktopAuthHandoff(organizationId);
+    persistContinuation(null);
+    clearPendingAuthIntent();
+    return true;
   }
 
   function getWebHandoffReturnUrl(payload: unknown) {
@@ -1103,7 +616,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
         headers.set("Authorization", `Bearer ${authToken}`);
       }
 
-      const { response, payload } = await requestJson("/v1/auth/desktop-handoff", {
+      const { response, payload } = await requestJson("/api/auth/desktop-handoff", {
         method: "POST",
         headers,
         body: JSON.stringify({ returnUrl: webAuthReturnUrl })
@@ -1131,21 +644,12 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  async function beginSignupOnboarding(authenticatedUser: AuthUser, _authMethod: AuthMethod) {
-    const autoName = deriveOnboardingWorkerName(authenticatedUser);
-    setWorkerName(autoName);
-    setLaunchError(null);
-    setLaunchStatus("Create a workspace to get started.");
-    persistOnboardingIntent(null);
-    return "dashboard" as const;
-  }
-
   async function resolveUserLandingRoute() {
     // Deliberately ignores desktopAuthRequested: callers that auto-redirect
     // (auth-screen) gate on it themselves, while explicit actions — the
     // "Go to dashboard" button on the signed-in handoff card — must resolve
     // a destination even mid desktop handoff.
-    if (!user) {
+    if (!runtimeConfigLoaded || !sessionHydrated || !user) {
       return null;
     }
 
@@ -1159,27 +663,58 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       return getJoinOrgRoute(pendingInvitationId);
     }
 
-    const dashboardRoute = await resolveDashboardRoute();
-
-    if (dashboardRoute) {
-      if (getPendingAuthIntent() === "models") {
-        clearPendingAuthIntent();
-        return getInferenceRoute();
-      }
-
-      return dashboardRoute;
+    if (continuationRef.current?.userId === user.id && continuationRef.current.setup) {
+      return continuationRef.current.setup.route;
     }
 
-    return "/organization";
+    const returnTo = resolveMemberReturnTo(
+      new URLSearchParams(window.location.search).get("returnTo"),
+      desktopAuthRequested || webAuthRequested,
+    );
+    if (returnTo) {
+      return returnTo;
+    }
+    if (runtimeConfig === EMPTY_RUNTIME_CONFIG) {
+      setAuthError("Could not load workspace configuration. Refresh to try again.");
+      return null;
+    }
+
+    const epoch = sessionEpochRef.current;
+    let directory: Awaited<ReturnType<typeof loadOrgDirectory>>;
+    try {
+      directory = await loadOrgDirectory();
+    } catch (error) {
+      if (epoch === sessionEpochRef.current) setAuthError(error instanceof Error ? error.message : "Could not load your organizations.");
+      return null;
+    }
+    if (epoch !== sessionEpochRef.current) return null;
+    requestOrgSelectionOnNextLoad(directory.orgs);
+    if (directory.orgs.length === 0) {
+      if (!isSingleOrgMode) continueSetup(null, "/organization");
+      return "/organization";
+    }
+
+    if (getPendingAuthIntent() === "models") {
+      clearPendingAuthIntent();
+      return getInferenceRoute();
+    }
+    return getOrgDashboardRoute();
   }
 
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
+    sessionEpochRef.current += 1;
     setAuthBusy(true);
     setAuthError(null);
     setSignupPasswordFeedback([]);
-    const submitMode: AuthMode = isSingleOrgMode && !runtimeConfig.singleOrgAllowPublicSignup && authMode === "sign-up" ? "sign-in" : authMode;
+    const pendingInvitationId = getPendingOrgInvitationId();
+    const submitMode: AuthMode = isSingleOrgMode
+      && !runtimeConfig.singleOrgAllowPublicSignup
+      && authMode === "sign-up"
+      && !pendingInvitationId
+      ? "sign-in"
+      : authMode;
     trackPosthogEvent("den_auth_submitted", {
       mode: submitMode,
       method: "email"
@@ -1190,7 +725,6 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       if (trimmedEmail && await redirectToRequiredSso(trimmedEmail)) {
         return null;
       }
-      const pendingInvitationId = getPendingOrgInvitationId();
       const endpoint = submitMode === "sign-up" && pendingInvitationId
         ? `/api/auth/sign-up/email?invite=${encodeURIComponent(pendingInvitationId)}`
         : submitMode === "sign-up"
@@ -1202,6 +736,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
               name: authName.trim() || DEFAULT_AUTH_NAME,
               email: trimmedEmail,
               password,
+              invite: pendingInvitationId ?? undefined,
             }
           : {
               email: trimmedEmail,
@@ -1237,14 +772,13 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       if (submitMode === "sign-up" && !token) {
         setUser(null);
         openVerificationStep(trimmedEmail, `We emailed a 6-digit verification code to ${trimmedEmail}. Enter it below to finish creating your account.`);
-        appendEvent("info", "Verification code sent", trimmedEmail);
         trackPosthogEvent("den_signup_verification_sent", {
           method: "email",
           email_domain: getEmailDomain(trimmedEmail),
         });
         return null;
       }
-      return await finalizeEmailPasswordSignIn(submitMode, trimmedEmail);
+      return await finalizeEmailPasswordSignIn(submitMode, trimmedEmail, payload);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown network error";
       setAuthError(message);
@@ -1340,6 +874,10 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       return;
     }
 
+    sessionEpochRef.current += 1;
+    persistContinuation(null);
+    clearPendingAuthIntent();
+    setDesktopRedirectUrl(null);
     setAuthBusy(true);
     setAuthError(null);
 
@@ -1357,24 +895,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
 
     setUser(null);
     setAuthToken(null);
-    setWorker(null);
-    setWorkers([]);
-    setWorkerLookupId("");
-    setWorkersError(null);
-    setLaunchError(null);
-    setBillingSummary(null);
-    setBillingError(null);
-    setOrgLimitError(null);
-    setBillingBusy(false);
-    setBillingLoadedOnce(false);
-    setTokenFetchedForWorkerId(null);
-    setDeleteBusyWorkerId(null);
-    setActionBusy(null);
-    setLaunchBusy(false);
-    setRuntimeSnapshot(null);
-    setRuntimeError(null);
-    setRuntimeUpgradeBusy(false);
-    setPendingRestoredWorkerId(null);
+    setHydratedSession({ token: null });
     setDesktopRedirectUrl(null);
     setDesktopRedirectAttempted(false);
     setAuthMode("sign-up");
@@ -1382,17 +903,10 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     setAuthName("");
     setPassword("");
     setAuthInfo(getAuthInfoForMode("sign-up"));
-    setLaunchStatus("Choose a worker name and launch.");
-    setEvents([]);
-    setWorkerQuery("");
-    setWorkerStatusFilter("all");
-    setWorkerName(DEFAULT_WORKER_NAME);
-    persistOnboardingIntent(null);
     resetPosthogUser();
     trackPosthogEvent("den_signout_completed", { method: "manual" });
 
     if (typeof window !== "undefined") {
-      window.localStorage.removeItem(LAST_WORKER_STORAGE_KEY);
       window.sessionStorage.removeItem(PENDING_SOCIAL_SIGNUP_STORAGE_KEY);
       window.sessionStorage.removeItem(PENDING_ORG_INVITATION_STORAGE_KEY);
       window.sessionStorage.removeItem(PENDING_WORKSPACE_CLAIM_STORAGE_KEY);
@@ -1423,470 +937,34 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     return nextUser;
   }
 
-  async function launchWorker(options: { source?: "manual" | "signup_auto"; workerNameOverride?: string } = {}) {
-    if (!user) {
-      setAuthError("Sign in before launching a worker.");
-      return "error" as const;
-    }
-
-    const resolvedLaunchName = options.workerNameOverride?.trim() || workerName.trim() || DEFAULT_WORKER_NAME;
-
-    setLaunchBusy(true);
-    setLaunchError(null);
-    setOrgLimitError(null);
-    setLaunchStatus(options.source === "signup_auto" ? "Creating your first worker..." : "Checking worker billing and launch eligibility...");
-    appendEvent("info", "Launch requested", resolvedLaunchName);
-
-    try {
-      const { response, payload } = await requestJson(
-        "/v1/workers",
-        {
-          method: "POST",
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-          body: JSON.stringify({
-            name: resolvedLaunchName,
-            destination: "cloud"
-          })
-        },
-        12000
-      );
-
-      const limitError = getOrgLimitError(payload);
-      if (limitError) {
-        setOrgLimitError(limitError);
-        setLaunchStatus(limitError.message);
-        setLaunchError(limitError.message);
-        appendEvent("warning", "Workspace limit reached", limitError.message);
-        return "limit" as const;
-      }
-
-      if (response.status === 402) {
-        setBillingSummary((current) => {
-          if (!current) {
-            return current;
-          }
-
-          return {
-            ...current,
-            hasActivePlan: false,
-            checkoutRequired: true,
-          };
-        });
-        const message = getErrorMessage(payload, "New cloud worker launches are not available for this account.");
-        setLaunchStatus(message);
-        setLaunchError(message);
-        appendEvent("warning", "Worker launch unavailable", message);
-        return "error" as const;
-      }
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Launch failed with ${response.status}.`);
-        setLaunchError(message);
-        setLaunchStatus("Launch failed. Fix the error and retry.");
-        appendEvent("error", "Launch failed", message);
-        return "error" as const;
-      }
-
-      const parsedWorker = getWorker(payload);
-      if (!parsedWorker) {
-        setLaunchError("Launch response was missing worker details.");
-        setLaunchStatus("Launch response format was unexpected.");
-        appendEvent("error", "Launch failed", "Worker payload missing");
-        return "error" as const;
-      }
-
-      const resolvedWorker = await withResolvedOpenworkCredentials(parsedWorker);
-      setWorker(resolvedWorker);
-      setWorkerLookupId(parsedWorker.workerId);
-      setPendingRestoredWorkerId(null);
-
-      if (resolvedWorker.status === "provisioning") {
-        setLaunchStatus("Provisioning started. We will keep checking automatically.");
-        appendEvent("info", "Provisioning started", `Worker ID ${parsedWorker.workerId}`);
-      } else {
-        setLaunchStatus(getWorkerStatusCopy(resolvedWorker.status));
-        appendEvent("success", "Worker launched", `Worker ID ${parsedWorker.workerId}`);
-      }
-
-      markOnboardingComplete();
-      return "success" as const;
-    } catch (error) {
-      const message =
-        error instanceof DOMException && error.name === "AbortError"
-          ? "Launch request took longer than expected. Provisioning can continue in the background. Refresh worker status below."
-          : error instanceof Error
-            ? error.message
-            : "Unknown network error";
-
-      setLaunchError(message);
-      setLaunchStatus("Launch request failed.");
-      appendEvent("error", "Launch failed", message);
-      return "error" as const;
-    } finally {
-      setLaunchBusy(false);
-      void refreshWorkers({ keepSelection: true });
-    }
-  }
-
-  async function checkWorkerStatus(options: { workerId?: string; quiet?: boolean; background?: boolean } = {}) {
-    const quiet = options.quiet === true;
-    const background = options.background === true;
-
-    if (!user) {
-      if (!quiet) {
-        setLaunchError("Sign in before checking worker status.");
-      }
-      return;
-    }
-
-    const fallbackId = workerLookupId.trim() || worker?.workerId || workers[0]?.workerId || "";
-    const id = options.workerId ?? fallbackId;
-    if (!id) {
-      if (!quiet) {
-        setLaunchError("No worker selected yet. Launch one first, then use this panel.");
-      }
-      return;
-    }
-
-    if (!background) {
-      setWorkerLookupId(id);
-    }
-
-    if (!background) {
-      setActionBusy("status");
-    }
-    if (!quiet) {
-      setLaunchError(null);
-    }
-
-    try {
-      const { response, payload } = await requestJson(`/v1/workers/${encodeURIComponent(id)}`, {
-        method: "GET",
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
-      });
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Status check failed with ${response.status}.`);
-        if (!quiet) {
-          setLaunchError(message);
-          appendEvent("error", "Status check failed", message);
-        }
-        return;
-      }
-
-      const summary = getWorkerSummary(payload);
-      if (!summary) {
-        if (!quiet) {
-          setLaunchError("Status response was missing worker details.");
-          appendEvent("error", "Status check failed", "Worker summary missing");
-        }
-        return;
-      }
-
-      mergeWorkerSummaryIntoList(summary);
-
-      const previousStatus = worker?.workerId === summary.workerId ? worker.status : null;
-      const nextWorker: WorkerLaunch =
-        worker && worker.workerId === summary.workerId
-          ? {
-              ...worker,
-              workerName: summary.workerName,
-              status: summary.status,
-              provider: summary.provider,
-              instanceUrl: summary.instanceUrl
-            }
-          : {
-              workerId: summary.workerId,
-              workerName: summary.workerName,
-              status: summary.status,
-              provider: summary.provider,
-              instanceUrl: summary.instanceUrl,
-              openworkUrl: summary.instanceUrl,
-              workspaceId: null,
-              clientToken: null,
-              ownerToken: null,
-              hostToken: null
-            };
-
-      const shouldUpdateActiveWorker = worker?.workerId === summary.workerId || (!background && workerLookupId === summary.workerId);
-      if (shouldUpdateActiveWorker) {
-        const resolvedWorker = await withResolvedOpenworkCredentials(nextWorker, { quiet: true });
-        setWorker(resolvedWorker);
-        setPendingRestoredWorkerId(null);
-        if (!background) {
-          setWorkerLookupId(summary.workerId);
-        }
-      }
-
-      if (!quiet) {
-        setLaunchStatus(`Worker ${summary.workerName} is currently ${summary.status}.`);
-        appendEvent("info", "Status refreshed", `${summary.workerName}: ${summary.status}`);
-      } else if (previousStatus && previousStatus !== summary.status) {
-        setLaunchStatus(getWorkerStatusCopy(summary.status));
-
-        if (summary.status === "healthy") {
-          appendEvent("success", "Provisioning complete", `${summary.workerName} is ready`);
-          markOnboardingComplete();
-        } else if (summary.status === "failed") {
-          appendEvent("error", "Provisioning failed", `${summary.workerName} failed to provision`);
-        } else {
-          appendEvent("info", "Provisioning update", `${summary.workerName}: ${summary.status}`);
-        }
-      }
-
-    } catch (error) {
-      if (!quiet) {
-        setLaunchError(error instanceof Error ? error.message : "Unknown network error");
-      }
-    } finally {
-      if (!background) {
-        setActionBusy(null);
-      }
-    }
-  }
-
-  async function generateWorkerToken() {
-    if (!user) {
-      setLaunchError("Sign in before fetching a worker access token.");
-      return;
-    }
-
-    const id = workerLookupId.trim() || worker?.workerId || workers[0]?.workerId || "";
-    if (!id) {
-      setLaunchError("No worker selected yet. Launch one first, then fetch a token.");
-      return;
-    }
-
-    setWorkerLookupId(id);
-    setActionBusy("token");
-    setLaunchError(null);
-
-    try {
-      const { response, payload } = await requestJson(`/v1/workers/${encodeURIComponent(id)}/tokens`, {
-        method: "POST",
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-        body: JSON.stringify({})
-      });
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Token fetch failed with ${response.status}.`);
-        setLaunchError(message);
-        appendEvent("error", "Token fetch failed", message);
-        return;
-      }
-
-      const tokens = getWorkerTokens(payload);
-      if (!tokens) {
-        setLaunchError("Token response returned no token values.");
-        appendEvent("error", "Token fetch failed", "Missing token payload");
-        return;
-      }
-
-      const nextWorker: WorkerLaunch =
-        worker && worker.workerId === id
-          ? {
-              ...worker,
-              openworkUrl: tokens.openworkUrl ?? worker.openworkUrl,
-              workspaceId: tokens.workspaceId ?? worker.workspaceId,
-              clientToken: tokens.clientToken,
-              ownerToken: tokens.ownerToken,
-              hostToken: tokens.hostToken
-            }
-          : {
-              workerId: id,
-              workerName: "Existing worker",
-              status: "unknown",
-              provider: null,
-              instanceUrl: null,
-              openworkUrl: tokens.openworkUrl,
-              workspaceId: tokens.workspaceId,
-              clientToken: tokens.clientToken,
-              ownerToken: tokens.ownerToken,
-              hostToken: tokens.hostToken
-            };
-
-      const resolvedWorker = await withResolvedOpenworkCredentials(nextWorker, { quiet: true });
-      setWorker(resolvedWorker);
-      setPendingRestoredWorkerId(null);
-      setLaunchStatus("Worker is ready to connect.");
-      appendEvent("success", "Owner token ready", `Worker ID ${id}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown network error";
-      setLaunchError(message);
-      appendEvent("error", "Token fetch failed", message);
-    } finally {
-      setActionBusy(null);
-    }
-  }
-
-  async function renameWorker(workerId: string, name: string) {
-    if (!user) {
-      setLaunchError("Sign in before renaming a worker.");
-      return false;
-    }
-
-    const nextName = name.trim();
-    if (!nextName) {
-      setLaunchError("Enter a worker name.");
-      return false;
-    }
-
-    setRenameBusyWorkerId(workerId);
-    setLaunchError(null);
-
-    try {
-      const { response, payload } = await requestJson(`/v1/workers/${encodeURIComponent(workerId)}`, {
-        method: "PATCH",
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-        body: JSON.stringify({ name: nextName })
-      });
-
-      if (!response.ok) {
-        const message = getErrorMessage(payload, `Rename failed with ${response.status}.`);
-        setLaunchError(message);
-        appendEvent("error", "Rename failed", message);
-        return false;
-      }
-
-      setWorkers((current) => current.map((entry) => entry.workerId === workerId ? { ...entry, workerName: nextName } : entry));
-      setWorker((current) => current && current.workerId === workerId ? { ...current, workerName: nextName } : current);
-      setLaunchStatus(`Renamed worker to ${nextName}.`);
-      appendEvent("success", "Worker renamed", nextName);
-      return true;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown network error";
-      setLaunchError(message);
-      appendEvent("error", "Rename failed", message);
-      return false;
-    } finally {
-      setRenameBusyWorkerId(null);
-    }
-  }
-
-  async function deleteWorker(workerId: string) {
-    if (!user) {
-      setLaunchError("Sign in before deleting a worker.");
-      return;
-    }
-
-    if (deleteBusyWorkerId || redeployBusyWorkerId || actionBusy !== null || launchBusy) {
-      return;
-    }
-
-    const target = workers.find((entry) => entry.workerId === workerId) ?? null;
-    const workerLabel = target?.workerName ?? "this worker";
-
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm(`Delete \"${workerLabel}\"? This removes it from your worker list.`);
-      if (!confirmed) {
-        return;
-      }
-    }
-
-    setDeleteBusyWorkerId(workerId);
-    setLaunchError(null);
-
-    try {
-      const { response, payload } = await requestJson(`/v1/workers/${encodeURIComponent(workerId)}`, {
-        method: "DELETE",
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
-      });
-
-      if (response.status !== 204 && !response.ok) {
-        const message = getErrorMessage(payload, `Delete failed with ${response.status}.`);
-        setLaunchError(message);
-        appendEvent("error", "Delete failed", message);
-        return;
-      }
-
-      setWorkers((current) => current.filter((entry) => entry.workerId !== workerId));
-      setWorker((current) => (current && current.workerId === workerId ? null : current));
-      setPendingRestoredWorkerId((current) => (current === workerId ? null : current));
-      setWorkerLookupId((current) => (current === workerId ? "" : current));
-
-      if (typeof window !== "undefined" && worker?.workerId === workerId) {
-        window.localStorage.removeItem(LAST_WORKER_STORAGE_KEY);
-      }
-
-      setLaunchStatus(`Deleted ${workerLabel}.`);
-      appendEvent("success", "Worker deleted", workerLabel);
-      await refreshWorkers({ keepSelection: false });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unknown network error";
-      setLaunchError(message);
-      appendEvent("error", "Delete failed", message);
-    } finally {
-      setDeleteBusyWorkerId(null);
-    }
-  }
-
-  async function redeployWorker(workerId: string) {
-    if (!user) {
-      setLaunchError("Sign in before redeploying a worker.");
-      return;
-    }
-
-    if (redeployBusyWorkerId || deleteBusyWorkerId || actionBusy !== null || launchBusy) {
-      return;
-    }
-
-    const target = workers.find((entry) => entry.workerId === workerId) ?? null;
-    const workerLabel = target?.workerName?.trim() || DEFAULT_WORKER_NAME;
-
-    if (typeof window !== "undefined") {
-      const confirmed = window.confirm(`Redeploy \"${workerLabel}\"? This removes the current worker and creates a new one with the same name.`);
-      if (!confirmed) {
-        return;
-      }
-    }
-
-    setRedeployBusyWorkerId(workerId);
-    setLaunchError(null);
-    setLaunchStatus(`Redeploying ${workerLabel}...`);
-    appendEvent("info", "Redeploy requested", workerLabel);
-
-    try {
-      const { response: deleteResponse, payload: deletePayload } = await requestJson(`/v1/workers/${encodeURIComponent(workerId)}`, {
-        method: "DELETE",
-        headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined
-      });
-
-      if (deleteResponse.status !== 204 && !deleteResponse.ok) {
-        const message = getErrorMessage(deletePayload, `Redeploy failed while deleting (${deleteResponse.status}).`);
-        setLaunchError(message);
-        appendEvent("error", "Redeploy failed", message);
-        return;
-      }
-
-      const outcome = await launchWorker({ source: "manual", workerNameOverride: workerLabel });
-      if (outcome === "success") {
-        appendEvent("success", "Worker redeployed", workerLabel);
-      }
-    } finally {
-      setRedeployBusyWorkerId(null);
-      void refreshWorkers({ keepSelection: true });
-    }
-  }
-
-  function selectWorker(item: WorkerListItem) {
-    setWorkerLookupId(item.workerId);
-    setWorker((current) => listItemToWorker(item, current));
+  function retryMemberAuthCheck() {
+    resetRuntimeConfig();
+    setRuntimeConfig(EMPTY_RUNTIME_CONFIG);
+    setRuntimeConfigLoaded(false);
+    setHydratedSession(null);
+    setMemberAuthCheckError(null);
+    setMemberAuthCheckStatus("checking");
+    setMemberAuthCheckAttempt((current) => current + 1);
   }
 
   useEffect(() => {
     let cancelled = false;
 
     void getRuntimeConfig().then((config) => {
-      if (!cancelled) {
-        setRuntimeConfig(config);
-        setRuntimeConfigLoaded(true);
+      if (cancelled) return;
+      if (config === EMPTY_RUNTIME_CONFIG) {
+        setMemberAuthCheckError("Could not load workspace configuration.");
+        setMemberAuthCheckStatus("error");
+        return;
       }
+      setRuntimeConfig(config);
+      setRuntimeConfigLoaded(true);
     });
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [memberAuthCheckAttempt]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1899,11 +977,11 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       setAuthMode(requestedMode);
     }
 
-    setDesktopAuthRequested(params.get("desktopAuth") === "1");
-    const requestedScheme = params.get("desktopScheme")?.trim() ?? "";
-    if (/^[a-z][a-z0-9+.-]*$/i.test(requestedScheme)) {
-      setDesktopAuthScheme(requestedScheme);
-    }
+    const stored = parseSetupContinuation(window.sessionStorage.getItem(SETUP_CONTINUATION_KEY));
+    persistContinuation(params.get("desktopAuth") === "1"
+      ? { userId: stored?.userId ?? null, setup: stored?.setup ?? null, at: Date.now(),
+          desktopScheme: "openwork" }
+      : stored);
     setWebAuthRequested(params.get("webAuth") === "1");
     const requestedWebReturnUrl = params.get("webAuthReturn")?.trim() ?? "";
     setWebAuthReturnUrl(requestedWebReturnUrl || null);
@@ -1920,6 +998,12 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    // Left behind by the removed cloud worker screen; clear them from browsers that still have them.
+    window.localStorage.removeItem("openwork:web:last-worker");
+    window.localStorage.removeItem("openwork:web:onboarding-intent");
+  }, []);
+
+  useEffect(() => {
     if (authToken) {
       window.localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, authToken);
     } else {
@@ -1928,14 +1012,27 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
   }, [authToken]);
 
   useEffect(() => {
+    if (!runtimeConfigLoaded) {
+      return;
+    }
+
     let cancelled = false;
+    setHydratedSession(null);
+    setMemberAuthCheckError(null);
+    setMemberAuthCheckStatus("checking");
 
     const hydrateSession = async () => {
+      const epoch = sessionEpochRef.current;
       try {
-        await refreshSession(true);
-      } finally {
-        if (!cancelled) {
-          setSessionHydrated(true);
+        await refreshSession(true, () => !cancelled);
+        if (!cancelled && epoch === sessionEpochRef.current) {
+          setHydratedSession({ token: authToken });
+          setMemberAuthCheckStatus("ready");
+        }
+      } catch {
+        if (!cancelled && epoch === sessionEpochRef.current) {
+          setMemberAuthCheckError("Could not check your sign-in status.");
+          setMemberAuthCheckStatus("error");
         }
       }
     };
@@ -1945,29 +1042,7 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [authToken]);
-
-  useEffect(() => {
-    if (!user) {
-      setWorkers([]);
-      setWorkersLoadedOnce(false);
-      setWorkersError(null);
-      return;
-    }
-
-    void refreshWorkers();
-  }, [user?.id, authToken]);
-
-  useEffect(() => {
-    if (!user) {
-      setBillingSummary(null);
-      setBillingError(null);
-      setBillingLoadedOnce(false);
-      return;
-    }
-
-    void refreshBilling({ quiet: true });
-  }, [user?.id, authToken]);
+  }, [authToken, runtimeConfigLoaded]);
 
   useEffect(() => {
     if (!user) {
@@ -1997,205 +1072,81 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
       method: pendingSocialSignup,
       email_domain: getEmailDomain(user.email)
     });
-
-    if (getPendingOrgInvitationId()) {
-      return;
-    }
-
-    void beginSignupOnboarding(user, pendingSocialSignup);
   }, [user?.id]);
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
+    if (!runtimeConfigLoaded || !sessionHydrated || !user || !continuation) return;
+    if (continuation.userId && continuation.userId !== user.id) {
+      persistContinuation(null);
+      setDesktopRedirectUrl(null);
+      setDesktopRedirectAttempted(false);
+      clearPendingAuthIntent();
+    } else if (!continuation.userId) {
+      persistContinuation({ ...continuation, userId: user.id });
     }
-
-    const raw = window.localStorage.getItem(LAST_WORKER_STORAGE_KEY);
-    if (!raw) {
-      return;
-    }
-
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (!isWorkerLaunch(parsed)) {
-        return;
-      }
-
-      const restored: WorkerLaunch = {
-        ...parsed,
-        openworkUrl: parsed.openworkUrl ?? parsed.instanceUrl,
-        workspaceId: parsed.workspaceId ?? parseWorkspaceIdFromUrl(parsed.instanceUrl ?? ""),
-        clientToken: null,
-        ownerToken: null,
-        hostToken: null
-      };
-
-      setWorker(restored);
-      setWorkerLookupId(restored.workerId);
-      setPendingRestoredWorkerId(restored.workerId);
-      setLaunchStatus(`Recovered worker ${restored.workerName}. ${getWorkerStatusCopy(restored.status)}`);
-      appendEvent("info", "Recovered worker context", `Worker ID ${restored.workerId}`);
-    } catch {
-      // Ignore invalid saved worker state.
-    }
-  }, []);
+  }, [runtimeConfigLoaded, sessionHydrated, user?.id, continuation]);
 
   useEffect(() => {
-    if (typeof window === "undefined" || !worker) {
-      return;
+    const current = continuationRef.current;
+    if (!runtimeConfigLoaded || !sessionHydrated || !user || current?.userId !== user.id || !current.setup) return;
+    if (["/dashboard/onboarding/people", "/dashboard/onboarding/tools", "/dashboard/onboarding"].includes(pathname)
+      && current.setup.route !== pathname) {
+      persistContinuation({ ...current, setup: { ...current.setup, route: pathname } });
     }
-
-    const serializable: WorkerLaunch = {
-      ...worker,
-      clientToken: null,
-      ownerToken: null,
-      hostToken: null
-    };
-
-    window.localStorage.setItem(LAST_WORKER_STORAGE_KEY, JSON.stringify(serializable));
-  }, [worker]);
+  }, [pathname, user?.id, runtimeConfigLoaded, sessionHydrated]);
 
   useEffect(() => {
-    if (!user || !worker) {
+    if (!runtimeConfigLoaded || !sessionHydrated || authBusy || !desktopAuthRequested || !user || continuation?.userId !== user.id
+      || setupPending || desktopRedirectUrl || desktopRedirectBusy || desktopRedirectAttempted) return;
+    // Invitation acceptance and workspace claims own their explicit handoffs.
+    if (pathname === "/join-org" || pathname === "/workspace-claim") return;
+    const pendingClaim = getPendingWorkspaceClaimToken();
+    const pendingInvitation = getPendingOrgInvitationId();
+    if (pendingClaim) {
+      router.replace(getWorkspaceClaimRoute(pendingClaim));
       return;
     }
-    if (pendingRestoredWorkerId === worker.workerId) {
+    if (pendingInvitation) {
+      router.replace(getJoinOrgRoute(pendingInvitation));
       return;
     }
-    if (worker.ownerToken || worker.clientToken) {
+    // Failed config fetches return the single-org fallback, not a deployment decision.
+    if (runtimeConfig === EMPTY_RUNTIME_CONFIG) {
+      setAuthError("Could not load workspace configuration. Refresh to try again.");
+      setDesktopRedirectAttempted(true);
       return;
     }
-    if (actionBusy !== null || launchBusy) {
-      return;
-    }
-    if (tokenFetchedForWorkerId === worker.workerId) {
-      return;
-    }
-
-    setTokenFetchedForWorkerId(worker.workerId);
-    void generateWorkerToken();
-  }, [actionBusy, launchBusy, pendingRestoredWorkerId, tokenFetchedForWorkerId, user, worker]);
-
-  const provisioningWorkerIds = workers
-    .filter((item) => item.status === "provisioning")
-    .map((item) => item.workerId);
-
-  useEffect(() => {
-    if (!user || provisioningWorkerIds.length === 0) {
-      return;
-    }
-
     let cancelled = false;
-    const poll = async () => {
-      if (cancelled || actionBusy !== null || launchBusy) {
+    const current = continuationRef.current;
+    const epoch = sessionEpochRef.current;
+    void loadOrgDirectory().then((directory) => {
+      if (cancelled || epoch !== sessionEpochRef.current || continuationRef.current !== current || getPendingOrgInvitationId() || getPendingWorkspaceClaimToken()) return;
+      if (directory.orgs.length === 0) {
+        if (!isSingleOrgMode) {
+          persistContinuation({ userId: user.id, desktopScheme: desktopAuthScheme, setup: { organizationId: null, route: "/organization" }, at: Date.now() });
+        }
+        router.replace("/organization");
         return;
       }
-
-      await Promise.all(
-        provisioningWorkerIds.map((workerId) =>
-          checkWorkerStatus({ workerId, quiet: true, background: true }),
-        ),
-      );
-    };
-
-    void poll();
-    const interval = window.setInterval(() => {
-      void poll();
-    }, WORKER_STATUS_POLL_MS);
-
-    return () => {
-      cancelled = true;
-      window.clearInterval(interval);
-    };
-  }, [actionBusy, launchBusy, provisioningWorkerIds.join(","), user?.id]);
+      void completeDesktopAuthHandoff();
+    }).catch((error: unknown) => {
+      if (!cancelled && epoch === sessionEpochRef.current) {
+        setAuthError(error instanceof Error ? error.message : "Could not load your organizations.");
+        setDesktopRedirectAttempted(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, [runtimeConfig, runtimeConfigLoaded, isSingleOrgMode, sessionHydrated, authBusy, desktopAuthRequested, user?.id, authToken, continuation?.userId, setupPending, pathname, desktopRedirectUrl, desktopRedirectBusy, desktopRedirectAttempted, desktopAuthScheme]);
 
   useEffect(() => {
-    const targetWorkerId = activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
-    if (!user || !targetWorkerId || pendingRestoredWorkerId === targetWorkerId) {
-      setRuntimeSnapshot(null);
-      setRuntimeError(null);
-      return;
-    }
-
-    void refreshRuntime(targetWorkerId, { quiet: true });
-  }, [user?.id, authToken, activeWorker?.workerId, pendingRestoredWorkerId, selectedWorker?.workerId]);
-
-  useEffect(() => {
-    const targetWorkerId = activeWorker?.workerId ?? selectedWorker?.workerId ?? null;
-    if (!targetWorkerId || runtimeSnapshot?.upgrade.status !== "running") {
-      return;
-    }
-
-    const timer = window.setInterval(() => {
-      void refreshRuntime(targetWorkerId, { quiet: true });
-    }, WORKER_STATUS_POLL_MS);
-
-    return () => window.clearInterval(timer);
-  }, [activeWorker?.workerId, selectedWorker?.workerId, runtimeSnapshot?.upgrade.status]);
-
-  useEffect(() => {
-    if (!desktopAuthRequested || !user || desktopRedirectUrl || desktopRedirectBusy || desktopRedirectAttempted) {
-      return;
-    }
-
-    void completeDesktopAuthHandoff();
-  }, [desktopAuthRequested, user?.id, authToken, desktopRedirectUrl, desktopRedirectBusy, desktopRedirectAttempted, desktopAuthScheme]);
-
-  useEffect(() => {
-    if (!webAuthRequested || !user || webRedirectBusy || webRedirectAttempted) {
+    if (!runtimeConfigLoaded || !sessionHydrated || !webAuthRequested || !user || webRedirectBusy || webRedirectAttempted
+      || pathname === "/join-org" || pathname === "/workspace-claim"
+      || getPendingOrgInvitationId() || getPendingWorkspaceClaimToken()) {
       return;
     }
 
     void completeWebAuthHandoff();
-  }, [webAuthRequested, webAuthReturnUrl, user?.id, authToken, webRedirectBusy, webRedirectAttempted]);
-
-  useEffect(() => {
-    if (!user || !onboardingPending) {
-      onboardingAutoLaunchKeyRef.current = null;
-      return;
-    }
-
-    if (!billingSummary) {
-      return;
-    }
-
-    if (billingSummary.featureGateEnabled && !billingSummary.hasActivePlan) {
-      return;
-    }
-
-    if (ownedWorkerCount > 0) {
-      markOnboardingComplete();
-      return;
-    }
-
-    if (launchBusy) {
-      return;
-    }
-
-    const autoLaunchKey = `${user.id}:${onboardingIntent?.workerName ?? DEFAULT_WORKER_NAME}`;
-    if (onboardingAutoLaunchKeyRef.current === autoLaunchKey) {
-      return;
-    }
-
-    onboardingAutoLaunchKeyRef.current = autoLaunchKey;
-    // Launch the first worker through the canonical POST /v1/workers path;
-    // the Den API selects the configured provisioner (render/daytona/static)
-    // server-side. PR #1181 replaced this with a bare markOnboardingComplete,
-    // which let signup finish with zero workers (#1961). launchWorker marks
-    // onboarding complete itself on success; on failure onboarding stays
-    // pending so the user sees the error and can retry.
-    void launchWorker({ source: "signup_auto", workerNameOverride: onboardingIntent?.workerName ?? DEFAULT_WORKER_NAME });
-  }, [billingSummary?.featureGateEnabled, billingSummary?.hasActivePlan, launchBusy, onboardingIntent?.workerName, onboardingPending, ownedWorkerCount, user?.id]);
-
-  useEffect(() => {
-    if (!user) {
-      return;
-    }
-
-    if ((workerName === DEFAULT_WORKER_NAME || workerName.trim().length === 0) && !onboardingPending) {
-      setWorkerName(deriveOnboardingWorkerName(user));
-    }
-  }, [onboardingPending, user?.id, workerName]);
+  }, [runtimeConfigLoaded, sessionHydrated, webAuthRequested, webAuthReturnUrl, user?.id, authToken, webRedirectBusy, webRedirectAttempted, pathname]);
 
   const showAuthFeedback = authInfo !== getAuthInfoForMode(authMode) || authError !== null;
 
@@ -2217,11 +1168,23 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     signupPasswordFeedback,
     user,
     sessionHydrated,
+    memberAuthCheckStatus,
+    memberAuthCheckError,
+    retryMemberAuthCheck,
     desktopAuthRequested,
     desktopAuthScheme,
+    setupPending,
+    setupOrganizationId: setupPending ? continuation?.setup?.organizationId ?? null : null,
+    continueSetup,
+    completeSetup,
     webAuthRequested,
     desktopRedirectUrl,
     desktopRedirectBusy,
+    retryDesktopAuthHandoff: () => {
+      if (handoffBusyRef.current || setupPending) return;
+      setAuthError(null);
+      setDesktopRedirectAttempted(false);
+    },
     showAuthFeedback,
     submitAuth,
     submitVerificationCode,
@@ -2229,63 +1192,11 @@ export function DenFlowProvider({ children }: { children: ReactNode }) {
     cancelVerification,
     beginSocialAuth,
     signOut,
+    revalidateSession: () => refreshSession(true),
     updateUserProfile,
     resolveUserLandingRoute,
-    billingSummary,
-    billingBusy,
-    billingError,
-    orgLimitError,
-    clearOrgLimitError: () => setOrgLimitError(null),
-    refreshBilling,
-    onboardingPending,
-    onboardingDecisionBusy,
-    workers,
-    filteredWorkers,
-    workersBusy,
-    workersLoadedOnce,
-    workersError,
-    workerQuery,
-    setWorkerQuery,
-    workerStatusFilter,
-    setWorkerStatusFilter,
-    selectedWorker,
-    activeWorker,
-    selectWorker,
-    workerName,
-    setWorkerName,
-    launchBusy,
-    launchStatus,
-    launchError,
-    actionBusy,
-    deleteBusyWorkerId,
-    redeployBusyWorkerId,
-    renameBusyWorkerId,
-    runtimeSnapshot,
-    runtimeBusy,
-    runtimeError,
-    runtimeUpgradeBusy,
-    copiedField,
-    events,
     runtimeConfig,
     runtimeConfigLoaded,
-    openworkDeepLink,
-    openworkAppConnectUrl,
-    hasWorkspaceScopedUrl,
-    additionalWorkerNeedsPlan,
-    selectedStatusMeta,
-    isSelectedWorkerFailed,
-    ownedWorkerCount,
-    refreshWorkers,
-    launchWorker,
-    checkWorkerStatus,
-    generateWorkerToken,
-    renameWorker,
-    deleteWorker,
-    redeployWorker,
-    refreshRuntime,
-    upgradeRuntime,
-    copyToClipboard,
-    getRuntimeServiceLabel,
   };
 
   return createElement(DenFlowContext.Provider, { value }, children);

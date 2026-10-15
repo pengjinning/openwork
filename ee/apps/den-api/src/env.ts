@@ -1,10 +1,15 @@
 import os from "node:os"
+import { readFileSync } from "node:fs"
 import path from "node:path"
+import { denUrls } from "@openwork-ee/utils/den-urls"
+import { parseGatewayDeploymentEnv } from "@openwork-ee/utils/gateway-env"
 import { DEN_WORKER_POLL_INTERVAL_MS } from "./CONSTS.js"
 import { normalizeConfiguredPublicApiBaseUrl } from "./request-url.js"
 import { resolveDenServiceVersion } from "./service-version.js"
 import { denApiAppVersion } from "./version.js"
 import { z } from "zod"
+import { readFreeInferenceConfig } from "@openwork/types/den/inference"
+import { parseFeatureEnvironment } from "@openwork/features"
 
 export const DEFAULT_DEN_DIAGNOSTICS_ORIGIN = "https://diagnostic.openworklabs.com"
 
@@ -16,12 +21,21 @@ const EnvSchema = z.object({
   DEN_DB_ENCRYPTION_KEY: z.string().trim().min(32),
   DB_MODE: z.enum(["mysql", "planetscale"]).optional(),
   BETTER_AUTH_SECRET: z.string().min(32),
-  BETTER_AUTH_URL: z.string().min(1),
+  BETTER_AUTH_URL: z.string().trim().min(1).optional(),
+  DEN_BASE_URL: z.string().trim().min(1).optional(),
   DATABASE_REDIS_URL: z.string().optional(),
   DATABASE_REDIS_ALLOW_INSECURE_INTERNAL: z.string().optional(),
   DEN_MCP_RESOURCE_URL: z.string().optional(),
   DEN_MCP_ADDITIONAL_RESOURCES: z.string().optional(),
+  DEN_BETTER_AUTH_COOKIE_DOMAIN: z.string().optional(),
+  /**
+   * The prefix of Den's sign-in cookies (default "openwork-den"). Browsers share cookies across every port of one
+   * host, so several Dens on 127.0.0.1 (local worlds, dev stacks) would otherwise read each other's sign-in. Each
+   * local world sets its own ("openwork-den-<id>"); den-web forwards any "openwork-den-" cookie already.
+   */
+  DEN_AUTH_COOKIE_PREFIX: z.string().regex(/^openwork-den(-[a-z0-9]{1,32})?$/).optional(),
   DEN_BETTER_AUTH_TRUSTED_ORIGINS: z.string().optional(),
+  DEN_TRUSTED_PROXIES: z.string().optional(),
   DEN_WEB_APP_HOSTS: z.string().optional(),
   GITHUB_CLIENT_ID: z.string().optional(),
   GITHUB_CLIENT_SECRET: z.string().optional(),
@@ -63,6 +77,7 @@ const EnvSchema = z.object({
   DEN_ALLOW_PRIVATE_MCP_URLS: z.string().optional(),
   DEN_DIAGNOSTICS_ORIGIN: z.string().optional(),
   DEN_DIAGNOSTICS_BEARER_TOKEN: z.string().optional(),
+  DEN_MAINTENANCE_TOKEN: z.string().optional(),
   DEN_GATEWAY_KEY: z.string().optional(),
   DEN_GATEWAY_ORIGIN: z.string().optional(),
   DEN_GOOGLE_OAUTH_AUTHORIZE_URL: z.string().optional(),
@@ -74,6 +89,7 @@ const EnvSchema = z.object({
   DEN_MICROSOFT_GRAPH_BASE_URL: z.string().optional(),
   PORT: z.string().optional(),
   CORS_ORIGINS: z.string().optional(),
+  DEN_CORS_HANDLED_BY_EDGE: z.string().optional(),
   DEN_API_PUBLIC_URL: z.string().optional(),
   DEN_API_VERSION: z.string().optional(),
   RENDER_GIT_COMMIT: z.string().optional(),
@@ -81,23 +97,44 @@ const EnvSchema = z.object({
   OPENWORK_INSTALLER_RELEASE_TAG: z.string().optional(),
   OPENWORK_INSTALLER_RELEASE_REPO: z.string().optional(),
   OPENWORK_INSTALLER_CACHE_DIR: z.string().optional(),
+  DEN_DESKTOP_RELEASES_BASE_URL: z.string().optional(),
+  DEN_DESKTOP_RELEASES_MODE: z.enum(["github", "static"]).optional(),
   DEN_DESKTOP_DEN_BASE_URL: z.string().optional(),
   DEN_MARKETING_URL: z.string().optional(),
   DEN_MCP_CLAIM_NAMESPACE: z.string().optional(),
   DEN_BOOTSTRAP_ADMIN_EMAILS: z.string().optional(),
-  WORKER_PROXY_PORT: z.string().optional(),
+  DEN_INITIAL_ADMIN_BOOTSTRAP_CODE: z.string().optional(),
+  DEN_INITIAL_ADMIN_BOOTSTRAP_CODE_FILE: z.string().optional(),
   WORKER_PROVISIONING_RECONCILE_INTERVAL_MS: z.string().optional(),
   WORKER_PROVISIONING_RECONCILE_STALE_MS: z.string().optional(),
   WORKER_PROVISIONING_RECONCILE_BATCH_SIZE: z.string().optional(),
+  CLOUD_PROVISION_DEADLINE_MS: z.string().optional(),
+  CLOUD_MATERIALIZATION_FAILURE_COOLDOWN_MS: z.string().optional(),
   CLOUD_IDLE_STOP_MINUTES: z.string().optional(),
   CLOUD_IDLE_LOOP_SECONDS: z.string().optional(),
   CLOUD_IDLE_STOP_BATCH_SIZE: z.string().optional(),
+  CLOUD_ACTIVITY_PROBE_TIMEOUT_MS: z.string().optional(),
+  CLOUD_UNREACHABLE_GRACE_MS: z.string().optional(),
+  CLOUD_STOP_FLUSH_TIMEOUT_MS: z.string().optional(),
   PROVISIONER_MODE: z.enum(["stub", "render", "daytona"]).optional(),
+  // Preferred name for the sandbox host that runs OpenWork Cloud instances;
+  // PROVISIONER_MODE remains accepted as an alias.
+  CLOUD_RUNTIME_PROVIDER: z.enum(["stub", "render", "daytona"]).optional(),
   WORKER_URL_TEMPLATE: z.string().optional(),
   WORKER_ACTIVITY_BASE_URL: z.string().optional(),
+  DEN_AUTOMATIONS_ENABLED: z.string().optional(),
+  DEN_DASHBOARDS_ENABLED: z.string().optional(),
+  // Default-on deployment kill switches.
+  DEN_AUDIT_CAPTURE_ENABLED: z.enum(["true", "false"]).default("true"),
+  DEN_AUDIT_VISIBILITY_ENABLED: z.enum(["true", "false"]).default("true"),
+  // Explicit installation entitlement, separate from feature availability and capture preference.
+  DEN_AUDIT_SELF_HOSTED_ENABLED: z.enum(["true", "false"]).default("false"),
+  DEN_OPENWORK_WEB_ENABLED: z.string().optional(),
+  DEN_AUTOMATIONS_RUNTIME_ENABLED: z.string().optional(),
   DEN_AUTOMATIONS_POLL_INTERVAL_MS: z.string().optional(),
   DEN_AUTOMATIONS_BATCH_SIZE: z.string().optional(),
   DEN_AUTOMATIONS_MAX_CONCURRENCY: z.string().optional(),
+  DEN_HEADLESS_AUTOMATIONS_MAX_CONCURRENCY: z.string().optional(),
   DEN_AUTOMATIONS_LEASE_MS: z.string().optional(),
   DEN_AUTOMATIONS_RUN_TIMEOUT_MS: z.string().optional(),
   DEN_AUTOMATIONS_RUNNER_CLAIM_DEADLINE_MS: z.string().optional(),
@@ -123,21 +160,14 @@ const EnvSchema = z.object({
   VERCEL_TEAM_SLUG: z.string().optional(),
   VERCEL_DNS_DOMAIN: z.string().optional(),
   DEN_PLAN_GATING_ENABLED: z.string().optional(),
-  DEN_INSTALL_LINKS_GATING_ENABLED: z.string().optional(),
   DEN_CONNECT_LINK_MODE: z.enum(["exchange", "signed"]).optional(),
   DEN_CONNECT_LINK_PRIVATE_KEY: z.string().optional(),
   DEN_CONNECT_LINK_KEY_ID: z.string().max(64).optional(),
-  DEN_MCP_CONNECTIONS_GATING_ENABLED: z.string().optional(),
   DEN_GENERATED_ARTIFACT_VIEWS_ENABLED: z.string().optional(),
-  DEN_REMOTE_MCP_APPS_ENABLED: z.string().optional(),
+  DEN_APP_MCP_SERVERS_ENABLED: z.string().optional(),
   SCIM_MAINTENANCE_INTERVAL_MS: z.string().optional(),
-  POLAR_FEATURE_GATE_ENABLED: z.string().optional(),
-  POLAR_API_BASE: z.string().optional(),
-  POLAR_ACCESS_TOKEN: z.string().optional(),
-  POLAR_PRODUCT_ID: z.string().optional(),
-  POLAR_BENEFIT_ID: z.string().optional(),
-  POLAR_SUCCESS_URL: z.string().optional(),
-  POLAR_RETURN_URL: z.string().optional(),
+  LIFECYCLE_EMAILS_ENABLED: z.string().optional(),
+  LIFECYCLE_EMAILS_INTERVAL_MS: z.string().optional(),
   DAYTONA_API_URL: z.string().optional(),
   DAYTONA_API_KEY: z.string().optional(),
   DAYTONA_TARGET: z.string().optional(),
@@ -151,7 +181,6 @@ const EnvSchema = z.object({
   DAYTONA_SANDBOX_AUTO_ARCHIVE_INTERVAL: z.string().optional(),
   DAYTONA_SANDBOX_AUTO_DELETE_INTERVAL: z.string().optional(),
   DAYTONA_SIGNED_PREVIEW_EXPIRES_SECONDS: z.string().optional(),
-  DAYTONA_WORKER_PROXY_BASE_URL: z.string().optional(),
   DAYTONA_SANDBOX_NAME_PREFIX: z.string().optional(),
   DAYTONA_SHARED_VOLUME_NAME: z.string().optional(),
   DAYTONA_VOLUME_NAME_PREFIX: z.string().optional(),
@@ -168,16 +197,25 @@ const EnvSchema = z.object({
   DAYTONA_HEALTHCHECK_TIMEOUT_MS: z.string().optional(),
   DEN_CKPT_INTERVAL_SECONDS: z.string().optional(),
   DEN_CKPT_KEEP: z.string().optional(),
-  INFERENCE_PROXY_BASE_URL: z.string().optional(),
+  GATEWAY_PROXY_BASE_URL: z.string().optional(),
   OPENROUTER_MANAGEMENT_API_KEY: z.string().optional(),
   OPENROUTER_WORKSPACE_ID: z.string().optional(),
   STRIPE_SECRET_KEY: z.string().optional(),
   STRIPE_WEBHOOK_SECRET: z.string().optional(),
   STRIPE_INFERENCE_PRICE_ID: z.string().optional(),
   STRIPE_SEAT_PRICE_ID: z.string().optional(),
+  STRIPE_OPENWORK_WEB_PRICE_ID: z.string().optional(),
   STRIPE_BILLING_SUCCESS_URL: z.string().optional(),
   STRIPE_BILLING_CANCEL_URL: z.string().optional(),
 }).superRefine((value, ctx) => {
+  if (!value.BETTER_AUTH_URL && !value.DEN_BASE_URL) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "BETTER_AUTH_URL or DEN_BASE_URL is required",
+      path: ["BETTER_AUTH_URL"],
+    })
+  }
+
   const inferredMode = value.DB_MODE ?? (value.DATABASE_URL ? "mysql" : "planetscale")
 
   if (inferredMode === "mysql" && !value.DATABASE_URL) {
@@ -200,12 +238,12 @@ const EnvSchema = z.object({
     }
   }
 
-  if (value.PROVISIONER_MODE === "daytona") {
-    for (const key of ["DAYTONA_API_KEY", "DAYTONA_WORKER_PROXY_BASE_URL"] as const) {
+  if ((value.CLOUD_RUNTIME_PROVIDER ?? value.PROVISIONER_MODE) === "daytona") {
+    for (const key of ["DAYTONA_API_KEY"] as const) {
       if (!value[key]) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          message: `${key} is required when PROVISIONER_MODE=daytona`,
+          message: `${key} is required when CLOUD_RUNTIME_PROVIDER=daytona`,
           path: [key],
         })
       }
@@ -213,13 +251,22 @@ const EnvSchema = z.object({
   }
 })
 
-const parsed = EnvSchema.parse(process.env)
+const gatewayDeployment = parseGatewayDeploymentEnv(process.env)
+const parsed = EnvSchema.parse({
+  ...process.env,
+  // Deprecated deployment alias; an explicitly set canonical value wins.
+  GATEWAY_PROXY_BASE_URL: process.env.GATEWAY_PROXY_BASE_URL ?? process.env.INFERENCE_PROXY_BASE_URL,
+})
 
 function splitCsv(value: string | undefined) {
   return (value ?? "")
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean)
+}
+
+function uniqueStrings(values: readonly string[]) {
+  return Array.from(new Set(values.filter(Boolean)))
 }
 
 // Lease and deadline math must never see NaN or a non-positive interval, so a
@@ -232,6 +279,18 @@ function automationTuning(value: string | undefined, fallback: number) {
 function optionalString(value: string | undefined) {
   const trimmed = value?.trim()
   return trimmed ? trimmed : undefined
+}
+
+function readOptionalSecretFile(envName: string, pathValue: string | undefined) {
+  const filePath = optionalString(pathValue)
+  if (!filePath) {
+    return undefined
+  }
+  try {
+    return readFileSync(filePath, "utf8").trim()
+  } catch {
+    throw new Error(`${envName} must point to a readable file`)
+  }
 }
 
 export type DenOrgMode = "single_org" | "multi_org"
@@ -286,6 +345,38 @@ function normalizeOrigin(origin: string) {
     return value
   }
   return value.replace(/\/+$/, "")
+}
+
+function normalizePublicWebOrigin(origin: string) {
+  const value = origin.trim()
+  const url = new URL(value)
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("BETTER_AUTH_URL or DEN_BASE_URL must use http or https")
+  }
+  return url.origin
+}
+
+function isLoopbackHostname(hostname: string) {
+  return hostname === "localhost" || hostname === "0.0.0.0" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]"
+}
+
+function denBaseUrlIsLoopback(denBaseUrl: string | undefined) {
+  if (!denBaseUrl) return false
+  try {
+    return isLoopbackHostname(new URL(denBaseUrl).hostname)
+  } catch {
+    return false
+  }
+}
+
+function deriveApiPublicUrlFromWebOrigin(input: { devMode: boolean; port: number; webOrigin: string }) {
+  const web = new URL(input.webOrigin)
+  if (input.devMode && isLoopbackHostname(web.hostname)) {
+    return `http://127.0.0.1:${input.port}`
+  }
+  const api = new URL(web.toString())
+  api.hostname = `api.${web.hostname}`
+  return api.origin
 }
 
 function isLocalRedisHost(hostname: string) {
@@ -386,27 +477,36 @@ function normalizeAbsoluteUrlCsv(envName: string, value: string | undefined) {
   return entries.map((entry) => normalizeOrigin(entry))
 }
 
-const corsOrigins = splitCsv(parsed.CORS_ORIGINS).map((origin) => normalizeOrigin(origin))
-const betterAuthTrustedOrigins = splitCsv(parsed.DEN_BETTER_AUTH_TRUSTED_ORIGINS)
-  .map((origin) => normalizeOrigin(origin))
-const mcpResourceUrl = optionalString(parsed.DEN_MCP_RESOURCE_URL)
+const configuredDenUrls = optionalString(parsed.DEN_BASE_URL)
+  ? denUrls({ DEN_BASE_URL: parsed.DEN_BASE_URL })
+  : undefined
+const configuredDenWebOrigin = configuredDenUrls?.web
+const betterAuthUrlInput = optionalString(parsed.BETTER_AUTH_URL) ?? configuredDenUrls?.web
+if (!betterAuthUrlInput) {
+  throw new Error("BETTER_AUTH_URL or DEN_BASE_URL is required")
+}
+const betterAuthUrl = normalizeOrigin(betterAuthUrlInput)
+const betterAuthPublicWebOrigin = normalizePublicWebOrigin(betterAuthUrl)
+const derivedWebOrigins = uniqueStrings([
+  ...(configuredDenWebOrigin ? [configuredDenWebOrigin] : []),
+  betterAuthPublicWebOrigin,
+])
+const corsOrigins = uniqueStrings([
+  ...derivedWebOrigins,
+  ...splitCsv(parsed.CORS_ORIGINS).map((origin) => normalizeOrigin(origin)),
+])
+const betterAuthTrustedOrigins = uniqueStrings([
+  ...derivedWebOrigins,
+  ...splitCsv(parsed.DEN_BETTER_AUTH_TRUSTED_ORIGINS).map((origin) => normalizeOrigin(origin)),
+])
+const configuredMcpResourceUrl = optionalString(parsed.DEN_MCP_RESOURCE_URL)
 const mcpAdditionalResources = normalizeAbsoluteUrlCsv(
   "DEN_MCP_ADDITIONAL_RESOURCES",
   parsed.DEN_MCP_ADDITIONAL_RESOURCES,
 )
 
-const polarFeatureGateEnabled =
-  (parsed.POLAR_FEATURE_GATE_ENABLED ?? "false").toLowerCase() === "true"
-
 const planGatingEnabled =
   (parsed.DEN_PLAN_GATING_ENABLED ?? "false").toLowerCase() === "true"
-
-// Deprecated compatibility knob for organization install links. The environment
-// variable is still parsed so existing deployment configs keep starting, but
-// organizationInstallLinksEnabled ignores this value: install links are
-// default-on unless org metadata explicitly disables them.
-const installLinksGatingEnabled =
-  (parsed.DEN_INSTALL_LINKS_GATING_ENABLED ?? String(planGatingEnabled)).toLowerCase() === "true"
 
 // Exchange mode is the zero-config default. Signed mode is an explicit v2
 // opt-in because its public key must already be trusted by the desktop build.
@@ -418,16 +518,11 @@ if (connectLinkMode === "signed" && (!connectLinkPrivateKeyPem || !connectLinkKi
     "DEN_CONNECT_LINK_MODE=signed requires DEN_CONNECT_LINK_PRIVATE_KEY and DEN_CONNECT_LINK_KEY_ID.",
   )
 }
+const initialAdminBootstrapCode = optionalString(parsed.DEN_INITIAL_ADMIN_BOOTSTRAP_CODE)
+  ?? readOptionalSecretFile("DEN_INITIAL_ADMIN_BOOTSTRAP_CODE_FILE", parsed.DEN_INITIAL_ADMIN_BOOTSTRAP_CODE_FILE)
 const connectLink = connectLinkMode === "signed" && connectLinkPrivateKeyPem && connectLinkKid
   ? { privateKeyPem: connectLinkPrivateKeyPem, kid: connectLinkKid }
   : null
-
-// Deprecated compatibility knob for member-facing org MCP connections. The
-// environment variable is still parsed so existing deployment configs keep
-// starting, but memberFacingMcpConnectionsEnabled ignores this value: Connect is
-// default-on unless org metadata explicitly disables it.
-const mcpConnectionsGatingEnabled =
-  (parsed.DEN_MCP_CONNECTIONS_GATING_ENABLED ?? "false").toLowerCase() === "true"
 
 // Generated custom views require the matching desktop MCP Apps host release.
 // Keep the Den capability fail-closed so a Den deployment cannot advertise
@@ -435,21 +530,103 @@ const mcpConnectionsGatingEnabled =
 const generatedArtifactViewsEnabled =
   (parsed.DEN_GENERATED_ARTIFACT_VIEWS_ENABLED ?? "false").trim().toLowerCase() === "true"
 
-// Imported apps use the released stable Desktop MCP Apps bridge and remain
-// independently disableable without enabling agent-authored generated views.
-const remoteMcpAppsEnabled =
-  (parsed.DEN_REMOTE_MCP_APPS_ENABLED ?? "true").trim().toLowerCase() === "true"
+// Apps built through Connect are served as their own MCP servers, and older
+// Workflow-bound views become read-only. On by default, including when set
+// empty; false, 0, off, or no (or any other value) restores the previous
+// behavior: no App servers, writable Workflow-bound views.
+const appMcpServersEnabled = parseBooleanFlag(optionalString(parsed.DEN_APP_MCP_SERVERS_ENABLED) ?? "true")
+
+// Desktop availability stays fail-closed, while an entirely unconfigured
+// server preserves the published-client runtime. An explicit availability
+// value also supplies the runtime default, so DEN_AUTOMATIONS_ENABLED=false is
+// a complete shutdown unless a mixed-version deployment explicitly keeps the
+// compatibility runtime on. A disabled runtime always forces availability off.
+const automationsRuntimeEnabled = parseBooleanFlag(
+  parsed.DEN_AUTOMATIONS_RUNTIME_ENABLED
+    ?? parsed.DEN_AUTOMATIONS_ENABLED
+    ?? "true",
+)
+const automationsEnabled = automationsRuntimeEnabled
+  && parseBooleanFlag(parsed.DEN_AUTOMATIONS_ENABLED ?? "false")
+const dashboardsEnabled = parseBooleanFlag(parsed.DEN_DASHBOARDS_ENABLED ?? "false")
+
+// Which product this install is (DEN_DEPLOYMENT, default self_hosted so a
+// misconfigured customer install never picks up cloud-only features) and the
+// operator's feature locks (DEN_FEATURE_*, rendered from Helm config.features).
+// See packages/features/src/registry.ts.
+const featureEnvironment = parseFeatureEnvironment(process.env)
+const fatalFeatureProblems = featureEnvironment.problems.filter((problem) => problem.fatal)
+if (fatalFeatureProblems.length > 0) {
+  throw new Error(fatalFeatureProblems.map((problem) => `${problem.variable} ${problem.message}`).join(" "))
+}
+for (const problem of featureEnvironment.problems) {
+  console.warn(`[features] ${problem.variable} ${problem.message}`)
+}
+
+// An edge that already answers CORS (reflecting the caller's origin) in front
+// of den-api makes den-api's own headers duplicates, which browsers reject.
+// The allowlist still feeds proxy-trust decisions; only header emission stops.
+const corsHandledByEdge = parseBooleanFlag(parsed.DEN_CORS_HANDLED_BY_EDGE ?? "false")
+const openworkWebEnabled = parseBooleanFlag(parsed.DEN_OPENWORK_WEB_ENABLED ?? "false")
 
 const devMode = (parsed.OPENWORK_DEV_MODE ?? "0").trim() === "1"
+const port = Number(parsed.PORT ?? "8790")
 const botIdProtectionEnabled = (parsed.DEN_BOTID_PROTECTION_ENABLED ?? "0").trim() === "1"
 const diagnosticsOrigin = normalizeDiagnosticsOrigin(parsed.DEN_DIAGNOSTICS_ORIGIN, devMode)
 const diagnosticsBearerToken = optionalString(parsed.DEN_DIAGNOSTICS_BEARER_TOKEN)
 if (diagnosticsBearerToken && diagnosticsBearerToken.length < 24) {
   throw new Error("DEN_DIAGNOSTICS_BEARER_TOKEN must contain at least 24 characters.")
 }
-const apiPublicUrl = normalizeConfiguredPublicApiBaseUrl(parsed.DEN_API_PUBLIC_URL, {
-  allowInsecureHttp: devMode,
+// Bearer token for scheduled maintenance callers (POST /internal/*). Unset hides those routes (404).
+const maintenanceToken = optionalString(parsed.DEN_MAINTENANCE_TOKEN)
+if (maintenanceToken && maintenanceToken.length < 24) {
+  throw new Error("DEN_MAINTENANCE_TOKEN must contain at least 24 characters.")
+}
+const derivedDenApiPublicUrl = configuredDenUrls && devMode && denBaseUrlIsLoopback(configuredDenUrls.web)
+  ? `http://127.0.0.1:${port}`
+  : configuredDenUrls?.api ?? deriveApiPublicUrlFromWebOrigin({ devMode, port, webOrigin: betterAuthPublicWebOrigin })
+const apiPublicUrl = normalizeConfiguredPublicApiBaseUrl(
+  optionalString(parsed.DEN_API_PUBLIC_URL) ?? derivedDenApiPublicUrl,
+  {
+    allowInsecureHttp: devMode,
+  },
+)
+function deriveBetterAuthCookieDomain(input: { webOrigin: string; apiPublicUrl: string | undefined }) {
+  if (!input.apiPublicUrl) return undefined
+  const web = new URL(input.webOrigin)
+  const api = new URL(input.apiPublicUrl)
+  if (web.protocol !== "https:" || api.protocol !== "https:") return undefined
+  const webHost = web.hostname.toLowerCase()
+  const apiHost = api.hostname.toLowerCase()
+  return apiHost.endsWith(`.${webHost}`) ? webHost : undefined
+}
+function normalizeBetterAuthCookieDomain(value: string | undefined) {
+  const configured = optionalString(value)
+  if (!configured) return undefined
+
+  const domain = configured.replace(/^\.+/, "").trim().toLowerCase()
+  if (!domain) {
+    throw new Error("DEN_BETTER_AUTH_COOKIE_DOMAIN must be a domain name, not an empty value.")
+  }
+
+  let parsedDomain: URL
+  try {
+    parsedDomain = new URL(`https://${domain}`)
+  } catch {
+    throw new Error("DEN_BETTER_AUTH_COOKIE_DOMAIN must be a valid domain name without protocol, path, query, or fragment.")
+  }
+
+  if (parsedDomain.hostname !== domain || parsedDomain.port || parsedDomain.username || parsedDomain.password || parsedDomain.pathname !== "/" || parsedDomain.search || parsedDomain.hash) {
+    throw new Error("DEN_BETTER_AUTH_COOKIE_DOMAIN must be a valid domain name without protocol, path, query, or fragment.")
+  }
+
+  return domain
+}
+const betterAuthCookieDomain = normalizeBetterAuthCookieDomain(parsed.DEN_BETTER_AUTH_COOKIE_DOMAIN) ?? deriveBetterAuthCookieDomain({
+  webOrigin: betterAuthPublicWebOrigin,
+  apiPublicUrl,
 })
+const mcpResourceUrl = configuredMcpResourceUrl ?? (configuredDenUrls ? `${apiPublicUrl}/mcp` : undefined)
 const publicUrlTrustedOrigins = Array.from(new Set([
   ...corsOrigins,
   ...betterAuthTrustedOrigins,
@@ -460,7 +637,7 @@ const publicUrlTrustedOrigins = Array.from(new Set([
 // origin in CORS_ORIGINS, so deriving public routes from the CORS allowlist
 // alone silently drops the one origin clients actually call.
 const publicProxyTrustedOrigins = Array.from(new Set([
-  normalizeOrigin(parsed.BETTER_AUTH_URL),
+  betterAuthUrl,
   ...publicUrlTrustedOrigins,
 ]))
 const orgMode = parseDenOrgMode(parsed.DEN_ORG_MODE)
@@ -475,10 +652,10 @@ const allowInsecureInternalRedis = parseBooleanFlag(parsed.DATABASE_REDIS_ALLOW_
 const requireEmailVerification = parsed.DEN_REQUIRE_EMAIL_VERIFICATION === undefined
   ? orgMode === "multi_org" && !devMode
   : parsed.DEN_REQUIRE_EMAIL_VERIFICATION.trim().toLowerCase() !== "false"
+// Fail-closed even in dev mode: offline rigs opt out explicitly via DEN_PASSWORD_BREACH_SCREENING_ENABLED=false.
 const passwordBreachScreeningEnabled = parsed.DEN_PASSWORD_BREACH_SCREENING_ENABLED === undefined
   ? true
   : parsed.DEN_PASSWORD_BREACH_SCREENING_ENABLED.trim().toLowerCase() !== "false"
-const port = Number(parsed.PORT ?? "8790")
 
 const daytonaSandboxPublic =
   (parsed.DAYTONA_SANDBOX_PUBLIC ?? "false").toLowerCase() === "true"
@@ -498,7 +675,11 @@ export const env = {
   dbMode: parsed.DB_MODE ?? (parsed.DATABASE_URL ? "mysql" : "planetscale"),
   planetscale: planetscaleCredentials,
   betterAuthSecret: parsed.BETTER_AUTH_SECRET,
-  betterAuthUrl: normalizeOrigin(parsed.BETTER_AUTH_URL),
+  betterAuthUrl,
+  betterAuthCookieDomain,
+  authCookiePrefix: parsed.DEN_AUTH_COOKIE_PREFIX ?? "openwork-den",
+  trustedProxies: splitCsv(parsed.DEN_TRUSTED_PROXIES),
+  webUrl: normalizePublicWebOrigin(betterAuthUrl),
   // SECURITY: `redis://` carries cached auth-session material in plaintext.
   // Non-local redis:// is rejected by default. Hosted platforms such as Render
   // may provide a private, non-public internal Redis URL without TLS; operators
@@ -516,7 +697,10 @@ export const env = {
   // Extra hostnames that serve the den-web frontend (and therefore expose
   // the Den API behind the /api/den proxy path). Entries starting with "."
   // are treated as suffix matches, e.g. ".example.com".
-  webAppHosts: splitCsv(parsed.DEN_WEB_APP_HOSTS).map((host) => host.toLowerCase()),
+  webAppHosts: uniqueStrings([
+    ...derivedWebOrigins.map((origin) => new URL(origin).hostname.toLowerCase()),
+    ...splitCsv(parsed.DEN_WEB_APP_HOSTS).map((host) => host.toLowerCase()),
+  ]),
   devMode,
   botIdProtectionEnabled,
   allowPrivateMcpUrls,
@@ -524,15 +708,20 @@ export const env = {
     origin: diagnosticsOrigin,
     bearerToken: diagnosticsBearerToken,
   },
+  maintenanceToken,
   gatewayKey: optionalString(parsed.DEN_GATEWAY_KEY),
   gatewayOrigin: normalizeOptionalHttpsOrigin("DEN_GATEWAY_ORIGIN", parsed.DEN_GATEWAY_ORIGIN),
   planGatingEnabled,
-  installLinksGatingEnabled,
   connectLink,
-  mcpConnectionsGatingEnabled,
   generatedArtifactViewsEnabled,
-  remoteMcpAppsEnabled,
+  appMcpServersEnabled,
   scimMaintenanceIntervalMs: Number(parsed.SCIM_MAINTENANCE_INTERVAL_MS ?? "300000"),
+  // Lifecycle reminder emails (claim reminder, team nudge). Off unless
+  // LIFECYCLE_EMAILS_ENABLED=1 so self-hosted deployments opt in explicitly.
+  lifecycleEmails: {
+    enabled: parsed.LIFECYCLE_EMAILS_ENABLED?.trim() === "1",
+    intervalMs: Number(parsed.LIFECYCLE_EMAILS_INTERVAL_MS ?? "900000"),
+  },
   requireEmailVerification,
   passwordBreachScreeningEnabled,
   github: {
@@ -590,7 +779,6 @@ export const env = {
       .map((email) => email.toLowerCase()),
   },
   port,
-  workerProxyPort: Number(parsed.WORKER_PROXY_PORT ?? "8789"),
   corsOrigins,
   apiPublicUrl,
   serviceVersion: resolveDenServiceVersion({
@@ -606,6 +794,10 @@ export const env = {
   installerReleaseTagExplicit: optionalString(parsed.OPENWORK_INSTALLER_RELEASE_TAG) !== undefined,
   installerReleaseRepo: optionalString(parsed.OPENWORK_INSTALLER_RELEASE_REPO) ?? "different-ai/openwork",
   installerCacheDir: optionalString(parsed.OPENWORK_INSTALLER_CACHE_DIR) ?? path.join(os.tmpdir(), "openwork-desktop-artifacts"),
+  // Desktop-release endpoint overrides for evals/self-host testing. Static mode
+  // keeps air-gapped deployments on the committed release snapshot.
+  desktopReleasesBaseUrl: optionalString(parsed.DEN_DESKTOP_RELEASES_BASE_URL),
+  desktopReleasesMode: parsed.DEN_DESKTOP_RELEASES_MODE ?? "github",
   // Native-provider endpoint overrides for evals/self-host testing. Unset in
   // production so Google, Microsoft Entra, and Graph use their public APIs.
   googleOAuthAuthorizeUrl: optionalString(parsed.DEN_GOOGLE_OAUTH_AUTHORIZE_URL),
@@ -616,29 +808,68 @@ export const env = {
   microsoftOAuthTokenUrl: optionalString(parsed.DEN_MICROSOFT_OAUTH_TOKEN_URL),
   microsoftGraphBaseUrl: optionalString(parsed.DEN_MICROSOFT_GRAPH_BASE_URL),
   desktopDenBaseUrl: optionalString(parsed.DEN_DESKTOP_DEN_BASE_URL),
-  marketingUrl: optionalString(parsed.DEN_MARKETING_URL),
-  mcpClaimNamespace: normalizeOrigin(optionalString(parsed.DEN_MCP_CLAIM_NAMESPACE) ?? parsed.BETTER_AUTH_URL),
+  marketingUrl: optionalString(parsed.DEN_MARKETING_URL) ?? configuredDenUrls?.web,
+  mcpClaimNamespace: normalizeOrigin(optionalString(parsed.DEN_MCP_CLAIM_NAMESPACE) ?? betterAuthUrl),
   bootstrapAdminEmails: splitCsv(parsed.DEN_BOOTSTRAP_ADMIN_EMAILS).map((email) => email.toLowerCase()),
-  provisionerMode: parsed.PROVISIONER_MODE ?? "stub",
+  initialAdminBootstrapCode,
+  provisionerMode: parsed.CLOUD_RUNTIME_PROVIDER ?? parsed.PROVISIONER_MODE ?? "stub",
   workerProvisioningReconcileIntervalMs: Number(parsed.WORKER_PROVISIONING_RECONCILE_INTERVAL_MS ?? "60000"),
-  workerProvisioningReconcileStaleMs: Number(parsed.WORKER_PROVISIONING_RECONCILE_STALE_MS ?? "1200000"),
+  // Live provisioning owners heartbeat `updated_at` every 30 seconds, so this
+  // staleness only fires after several missed beats. Keep it several multiples
+  // of `provisioningHeartbeatIntervalMs`.
+  workerProvisioningReconcileStaleMs: Number(parsed.WORKER_PROVISIONING_RECONCILE_STALE_MS ?? "180000"),
   workerProvisioningReconcileBatchSize: Number(parsed.WORKER_PROVISIONING_RECONCILE_BATCH_SIZE ?? "10"),
+  cloudProvisionDeadlineMs: Number(parsed.CLOUD_PROVISION_DEADLINE_MS ?? "900000"),
+  cloudMaterializationFailureCooldownMs: Number(parsed.CLOUD_MATERIALIZATION_FAILURE_COOLDOWN_MS ?? "120000"),
   cloudIdleStopMs: Number(parsed.CLOUD_IDLE_STOP_MINUTES ?? "30") * 60_000,
   cloudIdleLoopIntervalMs: Number(parsed.CLOUD_IDLE_LOOP_SECONDS ?? "60") * 1000,
   cloudIdleStopBatchSize: Number(parsed.CLOUD_IDLE_STOP_BATCH_SIZE ?? "10"),
+  // Den asks a running instance whether it is busy before stopping or
+  // restarting it. A busy instance can be slow, so this is longer than the
+  // 2.5 second signed-preview health probe.
+  cloudActivityProbeTimeoutMs: Number(parsed.CLOUD_ACTIVITY_PROBE_TIMEOUT_MS ?? "10000"),
+  // How long a running instance must answer nothing at all before Den treats
+  // it as dead and restarts it; a slow health probe alone never restarts.
+  cloudUnreachableGraceMs: Number(parsed.CLOUD_UNREACHABLE_GRACE_MS ?? "60000"),
+  // Bound for the best-effort checkpoint flush before Den stops a running instance.
+  cloudStopFlushTimeoutMs: Number(parsed.CLOUD_STOP_FLUSH_TIMEOUT_MS ?? "20000"),
   workerUrlTemplate: parsed.WORKER_URL_TEMPLATE,
   workerActivityBaseUrl:
     optionalString(parsed.WORKER_ACTIVITY_BASE_URL) ??
-    parsed.BETTER_AUTH_URL.trim().replace(/\/+$/, ""),
+    betterAuthUrl,
   automations: {
+    enabled: automationsEnabled,
+    runtimeEnabled: automationsRuntimeEnabled,
     pollIntervalMs: automationTuning(parsed.DEN_AUTOMATIONS_POLL_INTERVAL_MS, 15_000),
     batchSize: automationTuning(parsed.DEN_AUTOMATIONS_BATCH_SIZE, 25),
     maxConcurrency: automationTuning(parsed.DEN_AUTOMATIONS_MAX_CONCURRENCY, 4),
+    // Headless runs hold no computer, only a turn on the shared runner, so
+    // they get their own, larger pool instead of the OpenWork Web slots.
+    headlessMaxConcurrency: automationTuning(parsed.DEN_HEADLESS_AUTOMATIONS_MAX_CONCURRENCY, 16),
     leaseMs: automationTuning(parsed.DEN_AUTOMATIONS_LEASE_MS, 60_000),
     runTimeoutMs: automationTuning(parsed.DEN_AUTOMATIONS_RUN_TIMEOUT_MS, 900_000),
-    runnerClaimDeadlineMs: automationTuning(parsed.DEN_AUTOMATIONS_RUNNER_CLAIM_DEADLINE_MS, 60_000),
+    // How long a desktop occurrence stays claimable. A desktop is a laptop
+    // that sleeps, restarts, and changes networks, so this is a recovery
+    // window rather than a liveness check: a desktop that returns inside it
+    // still runs the occurrence, and only a genuinely absent desktop misses.
+    // Runs never stay claimable past their own next occurrence.
+    runnerClaimDeadlineMs: automationTuning(parsed.DEN_AUTOMATIONS_RUNNER_CLAIM_DEADLINE_MS, 900_000),
   },
-  inferenceProxyBaseUrl: optionalString(parsed.INFERENCE_PROXY_BASE_URL) ?? "http://127.0.0.1:8791",
+  dashboardsEnabled,
+  features: { deployment: featureEnvironment.deployment, locks: featureEnvironment.locks },
+  auditCaptureEnabled: parsed.DEN_AUDIT_CAPTURE_ENABLED === "true",
+  auditVisibilityEnabled: parsed.DEN_AUDIT_VISIBILITY_ENABLED === "true",
+  auditSelfHostedEnabled: parsed.DEN_AUDIT_SELF_HOSTED_ENABLED === "true",
+  corsHandledByEdge,
+  openworkWebEnabled,
+  inferenceFree: readFreeInferenceConfig(process.env),
+  inferenceProxyBaseUrl: optionalString(parsed.GATEWAY_PROXY_BASE_URL) ?? "http://127.0.0.1:8791",
+  // Keep known public Models destinations even when Gateway management is off.
+  modelsPublicBaseUrl: gatewayDeployment.modelsPublicBaseUrl ?? optionalString(parsed.GATEWAY_PROXY_BASE_URL) ?? "http://127.0.0.1:8791",
+  gatewayEnabled: gatewayDeployment.enabled,
+  gatewayProxyBaseUrl: gatewayDeployment.proxyBaseUrl,
+  // Existing member payloads retain their legacy destination until explicitly configured.
+  gatewayPublicBaseUrl: gatewayDeployment.publicBaseUrl ?? optionalString(parsed.GATEWAY_PROXY_BASE_URL) ?? "http://127.0.0.1:8791",
   openRouterManagementApiKey: optionalString(parsed.OPENROUTER_MANAGEMENT_API_KEY),
   openRouterWorkspaceId: optionalString(parsed.OPENROUTER_WORKSPACE_ID),
   stripe: {
@@ -646,6 +877,7 @@ export const env = {
     webhookSecret: optionalString(parsed.STRIPE_WEBHOOK_SECRET),
     inferencePriceId: optionalString(parsed.STRIPE_INFERENCE_PRICE_ID),
     seatPriceId: optionalString(parsed.STRIPE_SEAT_PRICE_ID),
+    openworkWebPriceId: optionalString(parsed.STRIPE_OPENWORK_WEB_PRICE_ID),
     billingSuccessUrl: optionalString(parsed.STRIPE_BILLING_SUCCESS_URL),
     billingCancelUrl: optionalString(parsed.STRIPE_BILLING_CANCEL_URL),
   },
@@ -680,15 +912,6 @@ export const env = {
     teamSlug: parsed.VERCEL_TEAM_SLUG,
     dnsDomain: parsed.VERCEL_DNS_DOMAIN,
   },
-  polar: {
-    featureGateEnabled: polarFeatureGateEnabled,
-    apiBase: parsed.POLAR_API_BASE ?? "https://api.polar.sh",
-    accessToken: parsed.POLAR_ACCESS_TOKEN,
-    productId: parsed.POLAR_PRODUCT_ID,
-    benefitId: parsed.POLAR_BENEFIT_ID,
-    successUrl: parsed.POLAR_SUCCESS_URL,
-    returnUrl: parsed.POLAR_RETURN_URL,
-  },
   daytona: {
     envPath: optionalString(parsed.OPENWORK_DAYTONA_ENV_PATH),
     apiUrl: optionalString(parsed.DAYTONA_API_URL) ?? "https://app.daytona.io/api",
@@ -712,8 +935,6 @@ export const env = {
     signedPreviewExpiresSeconds: Number(
       parsed.DAYTONA_SIGNED_PREVIEW_EXPIRES_SECONDS ?? "86400",
     ),
-    workerProxyBaseUrl:
-      optionalString(parsed.DAYTONA_WORKER_PROXY_BASE_URL) ?? "http://workers.local",
     sandboxNamePrefix:
       optionalString(parsed.DAYTONA_SANDBOX_NAME_PREFIX) ?? "den-daytona-worker",
     sharedVolumeName:
